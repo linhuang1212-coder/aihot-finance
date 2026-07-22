@@ -1,0 +1,29 @@
+# ===== 密钥 / 敏感,切勿提交 =====
+# token / deepseek_key / finnhub_key / twitterapi_key
+bot_config.json
+# 推送水位 / 去重状态
+bot_state.json
+*.token
+.env
+# watchdog.py 内嵌 SSH 明文密码 + 云端 IP;如需入库请先改成读环境变量
+watchdog.py
+
+# ===== 运行时数据 / 缓存(全部实时抓取生成,勿入库) =====
+# items.json / news.db / llm_cache / translations / x_state ...
+data/
+
+# ===== 日志 =====
+logs/
+
+# ===== 本地图片 / 备份 / 临时目录 =====
+新闻/
+_upgrade_tmp/
+public_backup_*/
+_pasted_small.jpg
+
+# ===== 本地 agent / IDE 配置 =====
+.claude/
+
+# ===== Python =====
+__pycache__/
+*.pyc

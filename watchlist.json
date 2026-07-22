@@ -1,0 +1,37 @@
+{
+  "_note": "你的重点关注标的。识别到就打实体标签、按标的可查、推送会优先。改完重启 server.py 生效。",
+  "_how": "每个标的：name=显示名；keywords=识别用关键词(中英文/代码/CEO名都可)；code/market 可选。",
+  "entities": [
+    {
+      "name": "英伟达",
+      "keywords": ["英伟达", "nvidia", "nvda", "黄仁勋", "jensen huang"],
+      "code": "NVDA",
+      "market": "us"
+    },
+    {
+      "name": "美光科技",
+      "keywords": ["美光", "美光科技", "micron"],
+      "_note": "裸 ticker 'mu' 太短会误命中(museum/stimulus)，故不列",
+      "code": "MU",
+      "market": "us"
+    },
+    {
+      "name": "AAOI",
+      "keywords": ["aaoi", "applied optoelectronics", "应用光电"],
+      "code": "AAOI",
+      "market": "us"
+    },
+    {
+      "name": "迈威尔科技",
+      "keywords": ["迈威尔", "marvell", "mrvl"],
+      "code": "MRVL",
+      "market": "us"
+    },
+    {
+      "name": "闪迪",
+      "keywords": ["闪迪", "sandisk", "sndk"],
+      "code": "SNDK",
+      "market": "us"
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AIHOT · 金融</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark"></span>
+      <span class="logo">AIHOT</span>
+      <span class="sep"></span>
+      <span class="section-name">金融</span>
+    </div>
+    <div class="topbar-right">
+      <div class="clock">
+        <span class="dot"></span>
+        <span>NY <b id="clock-ny">--:--:--</b></span>
+        <span class="div">·</span>
+        <span>BJ <b id="clock-bj">--:--:--</b></span>
+      </div>
+      <div class="search">
+        <input id="search" type="search" placeholder="霍尔木兹 / 英伟达 / 黄金 …" />
+      </div>
+      <button id="theme-toggle" class="icon-btn" title="切换深色/浅色">◐</button>
+    </div>
+  </header>
+
+  <!-- 实时行情条：app.js 优先读取 api/public/quotes，缺省时显示占位行情 -->
+  <div id="ticker" class="ticker" hidden>
+    <div class="live"><span class="dot"></span><span>LIVE</span></div>
+    <div class="track-wrap"><div class="track" id="ticker-track"></div></div>
+  </div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-group-title">视图</div>
+        <a class="nav-item active" data-view="selected">精选</a>
+        <a class="nav-item" data-view="all">全量</a>
+        <a class="nav-item" data-view="mainline">主线</a>
+        <a class="nav-item" data-view="breaking">突发快讯</a>
+        <a class="nav-item" data-view="daily">金融日报</a>
+        <a class="nav-item" data-view="analysis">深度分析</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">信源</div>
+        <a class="nav-item" data-view="source" data-source="DIGITIMES">DIGITIMES</a>
+        <a class="nav-item" data-view="source" data-source="X">X · KOL</a>
+        <a class="nav-item" data-view="stock">A股个股</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">分类</div>
+        <a class="nav-item" data-view="category" data-category="macro">宏观 · 政策</a>
+        <a class="nav-item" data-view="category" data-category="commodity">大宗 · 能源</a>
+        <a class="nav-item" data-view="category" data-category="equity">股指 · 汇率</a>
+        <a class="nav-item" data-view="category" data-category="sector">行业 · 公司</a>
+        <a class="nav-item" data-view="category" data-category="geo">地缘 · 风险</a>
+        <a class="nav-item" data-view="category" data-category="ashare">A股 · 公告</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">接入</div>
+        <a class="nav-item small" href="aihot-finance/SKILL.md" target="_blank">Skill 说明</a>
+        <a class="nav-item small" id="api-link" href="api/public/items?channel=finance&mode=selected" target="_blank">API 数据</a>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="content-head">
+        <h1 id="view-title">精选</h1>
+        <div class="kicker" id="view-kicker">Selected · 实时盯盘</div>
+        <div class="filters">
+          <div class="chips" id="market-chips">
+            <button class="chip active" data-market="">全部市场</button>
+            <button class="chip" data-market="a-share">A股</button>
+            <button class="chip" data-market="us">美股</button>
+            <button class="chip" data-market="hk">港股</button>
+            <button class="chip" data-market="oil">原油</button>
+            <button class="chip" data-market="gold">黄金</button>
+            <button class="chip" data-market="fx">汇率</button>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="hide-unverified" /> 隐藏未证实
+          </label>
+        </div>
+      </div>
+      <div id="list" class="list"></div>
+      <div id="empty" class="empty" hidden>没有匹配的条目。</div>
+      <div class="disclaimer">本内容基于客观公开资料整理，仅供参考，不代表平台立场，不构成任何投资建议。</div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
