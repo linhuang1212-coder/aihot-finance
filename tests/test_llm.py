@@ -1,8 +1,34 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import tempfile
 import unittest
 from unittest import mock
+
+
+class TestTranslate(unittest.TestCase):
+    def _resp(self, content):
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": content}}]}).encode("utf-8")
+        return cm
+
+    def test_translates_via_deepseek(self):
+        import llm
+        with mock.patch.object(llm, "_key", return_value="k"), \
+             mock.patch.object(llm.urllib.request, "urlopen",
+                               return_value=self._resp("英伟达发布新芯片")):
+            self.assertEqual(llm.translate("Nvidia unveils new chip"), "英伟达发布新芯片")
+
+    def test_no_key_returns_empty(self):
+        import llm
+        with mock.patch.object(llm, "_key", return_value=None):
+            self.assertEqual(llm.translate("hello"), "")
+
+    def test_empty_text_returns_empty(self):
+        import llm
+        with mock.patch.object(llm, "_key", return_value="k"):
+            self.assertEqual(llm.translate("   "), "")
 
 
 class TestSentimentEnrich(unittest.TestCase):

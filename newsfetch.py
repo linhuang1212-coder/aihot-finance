@@ -223,6 +223,18 @@ def translate(text, budget_max=220):
             return zh
     except Exception as e:
         print("[trans] error:", e)
+    # Google 没成(被墙/超时/空)-> 可选 DeepSeek 回退:云端阿里云 googleapis 被墙时启用,
+    # 由 env TRANSLATE_BACKEND=deepseek 开;家里默认不设,行为完全不变。
+    if os.environ.get("TRANSLATE_BACKEND") == "deepseek":
+        try:
+            import llm
+            zh = (llm.translate(text) or "").strip()
+            if zh:
+                cache[text] = zh
+                _trans_budget += 1
+                return zh
+        except Exception as e:
+            print("[trans] deepseek fallback error:", e)
     return text
 
 

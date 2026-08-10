@@ -395,7 +395,9 @@ def main():
     print("  停止: Ctrl+C")
     t = threading.Thread(target=_bg_refresh, daemon=True)
     t.start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # 默认只绑本机回环(nginx 反代到 127.0.0.1:PORT);要对外可设 HOST=0.0.0.0。
+    host = os.environ.get("HOST", "127.0.0.1")
+    ThreadingHTTPServer((host, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

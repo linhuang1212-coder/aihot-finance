@@ -100,6 +100,26 @@ def _call(news_lines):
     return json.loads(content).get("items", [])
 
 
+def translate(text):
+    """英文/繁体 -> 简体中文(DeepSeek)。供 newsfetch.translate 在 Google 翻译被墙
+    (云端阿里云)时回退。无 key/空文本 -> 返回空串(调用方保持原文)。"""
+    if not enabled() or not (text or "").strip():
+        return ""
+    body = json.dumps({
+        "model": MODEL, "temperature": 0, "max_tokens": 400,
+        "messages": [
+            {"role": "system", "content": "你是专业财经翻译。把用户给的文本准确翻成简体中文,"
+                                          "只输出译文本身,不要解释、不加引号。"},
+            {"role": "user", "content": text[:500]},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(API_URL, data=body, headers={
+        "Authorization": "Bearer " + _key(), "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.loads(r.read())
+    return (d["choices"][0]["message"]["content"] or "").strip()
+
+
 def enrich(items, budget=DEFAULT_BUDGET):
     """就地增强 items（去重后的代表条目）。返回实际新处理条数。"""
     if not enabled():

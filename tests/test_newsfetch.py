@@ -358,6 +358,39 @@ class TestChinaRelated(unittest.TestCase):
             self.assertFalse(nf._is_china_related(self._it(title_zh=t)), t)
 
 
+class TestTranslateFallback(unittest.TestCase):
+    """云端 Google 翻译被墙时,TRANSLATE_BACKEND=deepseek 回退用 DeepSeek。"""
+
+    def test_deepseek_fallback_when_google_fails(self):
+        import newsfetch as nf
+        import llm
+        import os
+        cache = {}
+        with mock.patch.object(nf, "_load_trans", return_value=cache), \
+             mock.patch.object(nf, "_http_get", side_effect=Exception("blocked")), \
+             mock.patch.object(llm, "translate", return_value="英伟达大涨"), \
+             mock.patch.dict(os.environ, {"TRANSLATE_BACKEND": "deepseek"}):
+            nf._trans_budget = 0
+            out = nf.translate("Nvidia soars")
+        self.assertEqual(out, "英伟达大涨")
+        self.assertEqual(cache.get("Nvidia soars"), "英伟达大涨")   # 已缓存
+
+    def test_no_fallback_without_env(self):
+        import newsfetch as nf
+        import llm
+        import os
+        cache = {}
+        with mock.patch.object(nf, "_load_trans", return_value=cache), \
+             mock.patch.object(nf, "_http_get", side_effect=Exception("blocked")), \
+             mock.patch.object(llm, "translate",
+                               side_effect=AssertionError("不该调用")), \
+             mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TRANSLATE_BACKEND", None)
+            nf._trans_budget = 0
+            out = nf.translate("Nvidia soars")
+        self.assertEqual(out, "Nvidia soars")   # 无 env -> 原样返回,不调 DeepSeek
+
+
 class TestMainline(unittest.TestCase):
     def _it(self, **kw):
         it = {"title_zh": "", "summary_zh": "", "body_excerpt": "", "title_orig": "",
