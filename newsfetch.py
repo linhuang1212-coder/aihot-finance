@@ -62,7 +62,12 @@ AI_KEYWORDS = ["AI", "人工智能", "英伟达", "Nvidia", "OpenAI", "大模型
                "semiconductor", "GPU", "DeepSeek", "Anthropic", "数据中心"]
 
 # ---- B/C 质量参数 ----
-SELECT_THRESHOLD = 5.0  # 综合分 >= 此值进「精选」
+SELECT_THRESHOLD = 5.0  # 综合分 >= 此值进「精选」(无 LLM 时的关键词兜底路径)
+# LLM 重要度 >= 此值进「精选」(= 推 Telegram)。只对新 prompt 打的分(缓存里有 pv)生效;
+# 旧 prompt 打的分(没有 pv)沿用旧门槛,两套刻度不混。
+# 2026-09-29 按新 prompt 的分数分布定为目标约 40 条/天,待用户标注后再按数据校准。
+SELECT_IMP = 7
+LEGACY_SELECT_IMP = 6
 
 IMPORTANT_KW = {  # 重要度关键词 -> 权重
     "美联储": 3, "fed": 3, "利率": 2, "降息": 3, "加息": 3, "rate cut": 3, "rate hike": 3,
@@ -1057,7 +1062,14 @@ def fetch_all():
         print("[llm] skipped:", e)
     out = []
     for it in reps:                                      # C 打分 + 精选判定
-        if it.get("llm_fin") is False:                   # LLM 判定非财经 -> 丢弃
+        if it.get("llm_fin") is False:                   # LLM 判定非财经
+            if not (it.get("source") or "").startswith("X·"):
+                continue                                 # 非白名单源:丢弃
+            # X 白名单是人工挑的账号:不丢(推文只抓一次,丢了回不来),只是不进精选。
+            # 2026-09-30 新 prompt 初版曾把约 30% 的地缘/政治推文判成 fin=false。
+            _finalize(it)
+            it["selected"] = False
+            out.append(it)
             continue
         _finalize(it)
         out.append(it)
@@ -1130,6 +1142,15 @@ def repair_items(rows):
     return out
 
 
+def _select_imp(it):
+    """有 pv 的分(2026-09-30 起的新 prompt 打的)用新门槛;没有 pv 的是旧 prompt 的分,用旧门槛。
+    不比较 pv 是否等于当前版本:以后微调 prompt 时,7 分制的分不能被退回旧刻度。
+    库里读出来的行不带 llm_pv(不入库),按 id 回查缓存。"""
+    import llm
+    pv = it.get("llm_pv") or (llm._load().get(it.get("id")) or {}).get("pv")
+    return SELECT_IMP if pv else LEGACY_SELECT_IMP
+
+
 def _finalize(it):
     """打分 + 精选判定 + 热度档(fetch_all 与补救轮共用)。"""
     if it.get("llm_importance") is not None:
@@ -1138,7 +1159,7 @@ def _finalize(it):
         if it.get("entities"):
             s += 1.0
         s += _sentiment_boost(it)                        # 强方向+自选标的加权
-        it["score"], it["selected"] = round(s, 2), imp >= 6
+        it["score"], it["selected"] = round(s, 2), imp >= _select_imp(it)
     else:
         it["score"], it["selected"] = _score(it)
     if is_hidden(it):

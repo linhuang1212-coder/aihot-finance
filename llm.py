@@ -47,6 +47,28 @@ def _pack():
     return _pack_text
 
 
+def prompt_version():
+    """当前 prompt 的版本号(内容哈希前 8 位)。写进每条缓存,评测时按版本筛;
+    有 pv 的分用新门槛,没有 pv 的(旧 prompt 打的)沿用旧门槛,两套刻度不混。"""
+    import hashlib
+    return hashlib.sha1(_pack().encode("utf-8")).hexdigest()[:8]
+
+
+EXCERPT_CHARS = 200
+
+
+def build_line(it):
+    """喂给打分模型的一行:中文标题 + 原文/摘要(最多 EXCERPT_CHARS 字)。
+    原来只给标题前 80 字——DIGITIMES「產能吃緊」、推文里的关键数字常在摘要/原文里。
+    刻意不给信源名(避免拿名气重复加分)。"""
+    title = " ".join((it.get("title_zh") or "").split())[:100]
+    ex = it.get("title_orig") or it.get("body_excerpt") or ""
+    ex = " ".join(ex.split())[:EXCERPT_CHARS]
+    if ex and ex[:40] != title[:40]:
+        return "标题:%s | 原文/摘要:%s" % (title, ex)
+    return "标题:%s" % (ex if len(ex) > len(title) else title)   # 中文推文:原文就是更长的标题
+
+
 def _key():
     k = os.environ.get("DEEPSEEK_API_KEY")
     if k:
@@ -147,11 +169,11 @@ def enrich(items, budget=DEFAULT_BUDGET):
     todo = [it for it in items if it["id"] not in cache][:budget]
     done = fails = bad400 = 0
     any_ok, rejected = False, []
+    pv = prompt_version()
     queue = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
     while queue:
         batch = queue.pop(0)
-        lines = "\n".join("%d. %s" % (j + 1, (it.get("title_zh") or "")[:80])
-                          for j, it in enumerate(batch))
+        lines = "\n".join("%d. %s" % (j + 1, build_line(it)) for j, it in enumerate(batch))
         try:
             results = _call(lines)
             fails = bad400 = 0
@@ -193,6 +215,7 @@ def enrich(items, budget=DEFAULT_BUDGET):
                 "dir": r.get("dir"),
                 "tgt": (r.get("tgt") or "").strip(),
                 "str": r.get("str"),
+                "pv": pv,
             }
             done += 1
     if any_ok:
@@ -213,6 +236,7 @@ def enrich(items, budget=DEFAULT_BUDGET):
                                 ("macro", "commodity", "equity", "sector", "geo", "ashare")]
         if r.get("imp") is not None:
             it["llm_importance"] = r["imp"]
+            it["llm_pv"] = r.get("pv")
         it["llm_fin"] = bool(r.get("fin", True))
         if r.get("rumor"):                       # LLM 判定为传闻 -> 标未证实
             it["verified"] = "unverified"

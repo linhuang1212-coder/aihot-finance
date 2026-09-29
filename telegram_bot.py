@@ -146,13 +146,13 @@ def is_nvidia(it):
 
 
 def _worth_push(it):
-    """推送门槛：精选直接推；英伟达必推，但要过重要度门槛（砍掉 1–3 的琐碎/花边/传闻）。
+    """推送门槛：精选直接推；英伟达必推，但要过重要度门槛（砍掉 ≤4 的琐碎/花边/框架无关）。
     LLM 还没打分（llm_importance 为空）的英伟达条目维持原行为照推，稳妥不漏真消息。"""
     if it.get("selected"):
         return True
     if is_nvidia(it):
         imp = it.get("llm_importance")
-        return imp is None or imp >= 4
+        return imp is None or imp >= 5      # 新刻度下 4 = 与框架无关/峰会国宴花边的上限
     return False
 
 
