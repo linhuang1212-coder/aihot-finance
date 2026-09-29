@@ -3,6 +3,8 @@
 bot_config.json
 # 推送水位 / 去重状态
 bot_state.json
+# 上一份订阅状态备份(atomicio keep_prev,含订阅者 chat_id)
+bot_state.json.prev
 *.token
 .env
 # watchdog.py 内嵌 SSH 明文密码 + 云端 IP;如需入库请先改成读环境变量
@@ -27,3 +29,7 @@ _pasted_small.jpg
 # ===== Python =====
 __pycache__/
 *.pyc
+
+# ===== 原子写的临时文件 / 读坏后改名留底的文件 =====
+*.tmp-*
+*.corrupt-*
