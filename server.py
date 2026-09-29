@@ -134,7 +134,33 @@ def refresh(verbose=True):
         print("[refresh] 窗口内 %d 条（近 %d 天）" % (len(ITEMS), store.RETENTION_DAYS))
 
 
-def _bg_refresh():
+def hot_start():
+    """用磁盘缓存热启动 ITEMS(毫秒级、不联网),让端口能立即开始服务。返回条数。
+    优先 items.json:它是上一轮 refresh() 的产物,已带 stock_only / propagation 等派生字段,
+    比直接读库更接近稳态;读不到再退回库,最后退空列表(空列表也要能开服务,总好过 502)。"""
+    global ITEMS
+    try:
+        ITEMS = load_cache()
+        print("  缓存热启动: %d 条(后台抓取中,稍后自动刷新)" % len(ITEMS))
+    except Exception:
+        try:
+            import store
+            ITEMS = _attach_dt(store.recent_items())
+            print("  库热启动: %d 条(无 items.json,后台抓取中)" % len(ITEMS))
+        except Exception:
+            ITEMS = []
+            print("  无本地缓存,后台首轮抓取中…")
+    return len(ITEMS)
+
+
+def _bg_refresh(first_refresh=True):
+    """后台刷新循环。first_refresh=True 时先立刻跑一轮 refresh():首轮真实抓取(金十 + X/KOL
+    + LLM 增强)可达数分钟,放这里而不是 main() 里,保证端口在启动后**立即**可用。
+    2026-09-10 实测:重启后 main() 卡在首轮 refresh() 上,09:46:59 起进程,09:50:08 才就绪,
+    公网 /news/ 白吐了 3 分钟 502,run.py 的健康检查还误报了一次"数据服务无法访问"。"""
+    if first_refresh:
+        refresh(verbose=True)
+        print("  数据: %d 条" % len(ITEMS))
     while True:
         time.sleep(REFRESH_SECONDS)
         refresh(verbose=True)
@@ -388,8 +414,7 @@ def main():
     migrated = store.migrate_from_json(DATA_FILE)
     if migrated:
         print("  迁移 %d 条历史进库" % migrated)
-    refresh(verbose=True)
-    print("  数据: %d 条" % len(ITEMS))
+    hot_start()
     print("  自动刷新: 每 %d 秒" % REFRESH_SECONDS)
     print("  打开: http://localhost:%d" % PORT)
     print("  停止: Ctrl+C")

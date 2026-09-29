@@ -159,19 +159,24 @@ function cardNode(it) {
   const rail = el("div", "card-rail");
   rail.appendChild(el("div", "t", esc(beijingTime(it.published_at))));
   rail.appendChild(el("div", "s", esc(it.source)));
+  // 信号列：利多/利空(方向+强度+标的) + 热度 —— 填满左导轨、一眼扫读
+  const sent = it.sentiment;
+  if (sent && sent.dir) {
+    const dcls = sent.dir === "利多" ? "up" : sent.dir === "利空" ? "down" : "flat";
+    const chip = el("div", "rail-sent rail-sent-" + dcls);
+    const n = Math.max(0, Math.min(3, sent.str || 0));
+    chip.innerHTML = `<span class="rs-dir">${esc(sent.dir)}</span>`
+      + (n ? `<span class="rs-str">${"●".repeat(n)}</span>` : "")
+      + (sent.tgt ? `<span class="rs-tgt">${esc(sent.tgt)}</span>` : "");
+    rail.appendChild(chip);
+  }
+  if (it.heat) rail.appendChild(el("div", "rail-heat", esc(it.heat)));
   card.appendChild(rail);
 
   const main = el("div", "card-main");
 
-  // 眉栏：利多/利空 · 热度 · 未证实
+  // 眉栏：仅"未证实"(利多利空/热度已移到左导轨信号列)
   const eb = el("div", "card-eyebrow");
-  const sent = it.sentiment;
-  if (sent && (sent.dir === "利多" || sent.dir === "利空")) {
-    const cls = "badge " + (sent.dir === "利多" ? "badge-bullish" : "badge-bearish");
-    const label = sent.tgt ? sent.dir + " · " + sent.tgt : sent.dir;  // A股语境：利多红、利空绿
-    eb.appendChild(el("span", cls, esc(label)));
-  }
-  if (it.heat) eb.appendChild(el("span", "badge badge-heat", esc(it.heat)));
   if (unv) eb.appendChild(el("span", "badge badge-unverified", "未证实"));
   if (eb.children.length) main.appendChild(eb);
 

@@ -1,8 +1,14 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="dark" translate="no">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- 禁止浏览器翻译:页面本身就是中文,翻它只有坏处没有好处。
+       2026-09-11 实测:Chrome 把本页源语言当成英语后,会把中文喂进 EN->ZH 模型硬编,
+       "阿联酋"->"季后赛"、"外交关系"->"决赛关系"、"升温"->"隐患",而库里/接口/缓存的数据
+       完全正常——这种"只坏在屏幕上"的故障极易被误判成翻译管线坏了,查了一圈才定位到浏览器。
+       meta 那条是 Chrome/Google 认的;translate="no" 是 HTML5 标准属性,Edge/Safari 认。 -->
+  <meta name="google" content="notranslate" />
   <title>AIHOT · 金融</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -47,6 +53,7 @@
       </div>
       <div class="nav-group">
         <div class="nav-group-title">信源</div>
+        <a class="nav-item" href="gold/" target="_blank" title="GoldHot 黄金舆情：贵金属消息对现货黄金的影响与传导逻辑">黄金板块 ↗</a>
         <a class="nav-item" data-view="source" data-source="DIGITIMES">DIGITIMES</a>
         <a class="nav-item" data-view="source" data-source="X">X · KOL</a>
         <a class="nav-item" data-view="stock">A股个股</a>

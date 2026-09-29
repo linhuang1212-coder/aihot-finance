@@ -32,7 +32,8 @@ REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))  # 5分钟(2026-
 DATA_FILE = os.path.join(BASE, "data", "items.json")
 
 CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PORT=PORT,
-                 AIHOT_SERVER="http://localhost:%s" % PORT)
+                 AIHOT_SERVER="http://localhost:%s" % PORT,
+                 TRANSLATE_BACKEND="deepseek")   # Google 翻译老限流,改用 DeepSeek 直译
 CHILDREN = {
     "server": [sys.executable, "-u", "server.py"],
     "bot": [sys.executable, "-u", "telegram_bot.py"],
