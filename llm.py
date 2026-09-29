@@ -12,6 +12,9 @@ import os
 import json
 import urllib.request
 
+import atomicio
+import health
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(BASE_DIR, "data", "llm_cache.json")
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -62,10 +65,8 @@ def enabled():
 def _load():
     global _cache
     if _cache is None:
-        try:
-            with open(CACHE_FILE, encoding="utf-8") as f:
-                _cache = json.load(f)
-        except Exception:
+        _cache = atomicio.read_json(CACHE_FILE, {})
+        if not isinstance(_cache, dict):
             _cache = {}
     return _cache
 
@@ -73,12 +74,22 @@ def _load():
 def _save():
     if _cache is None:
         return
-    try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_cache, f, ensure_ascii=False)
-    except Exception as e:
-        print("[llm] cache save error:", e)
+    atomicio.write_json(CACHE_FILE, _cache)     # 原子写:断电/被杀不会留下半截文件
+
+
+def prune(keep_ids):
+    """缓存只留还在工作集里的 id(X 推文只增强一次,出窗口后缓存永远用不到;实测 86% 是这种)。
+    返回删掉的条数;有删才落盘。keep_ids 太少(库读失败等)时不动,防误清空。"""
+    cache = _load()
+    keep = set(keep_ids)
+    if len(keep) < 1000:
+        return 0
+    dead = [k for k in cache if k not in keep]
+    for k in dead:
+        del cache[k]
+    if dead:
+        _save()
+    return len(dead)
 
 
 def _call(news_lines):
@@ -92,12 +103,23 @@ def _call(news_lines):
             {"role": "user", "content": user},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(API_URL, data=body, headers={
-        "Authorization": "Bearer " + _key(), "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        d = json.loads(r.read())
+    d = _post(body, timeout=60)
     content = d["choices"][0]["message"]["content"]
     return json.loads(content).get("items", [])
+
+
+def _post(body, timeout):
+    """调 DeepSeek 并记健康(402 欠费等连续失败 -> health 告警)。"""
+    req = urllib.request.Request(API_URL, data=body, headers={
+        "Authorization": "Bearer " + _key(), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read())
+    except Exception as e:
+        health.note_error("deepseek", e)
+        raise
+    health.note_ok("deepseek")
+    return d
 
 
 def translate(text):
@@ -113,10 +135,7 @@ def translate(text):
             {"role": "user", "content": text[:500]},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(API_URL, data=body, headers={
-        "Authorization": "Bearer " + _key(), "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
+    d = _post(body, timeout=15)       # 单条翻译 15s 足够;原来 30s,故障时一轮被逐条拖十几分钟
     return (d["choices"][0]["message"]["content"] or "").strip()
 
 
@@ -126,15 +145,34 @@ def enrich(items, budget=DEFAULT_BUDGET):
         return 0
     cache = _load()
     todo = [it for it in items if it["id"] not in cache][:budget]
-    done = 0
-    for i in range(0, len(todo), BATCH):
-        batch = todo[i:i + BATCH]
+    done = fails = bad400 = 0
+    any_ok, rejected = False, []
+    queue = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
+    while queue:
+        batch = queue.pop(0)
         lines = "\n".join("%d. %s" % (j + 1, (it.get("title_zh") or "")[:80])
                           for j, it in enumerate(batch))
         try:
             results = _call(lines)
+            fails = bad400 = 0
+            any_ok = True
         except Exception as e:
             print("[llm] call error:", e)
+            if getattr(e, "code", None) == 400:
+                # 400 多半是内容风控拒了批里某一条:拆成单条重送,只丢真正被拒的那条,
+                # 别让同批 7 条陪着失败(原来补救轮也总把它们打成同一批,永远补不上)
+                if len(batch) > 1:
+                    queue[:0] = [[it] for it in batch]
+                    continue
+                rejected.append(batch[0]["id"])
+                bad400 += 1
+                if bad400 >= 4:                  # 单条也接连被拒:多半是整体故障,本轮停
+                    break
+                continue
+            fails += 1
+            if fails >= 2:                       # 连续失败:本轮放弃,别逐批等超时(补救轮会重试)
+                print("[llm] 连续失败,本轮停止增强")
+                break
             continue
         by_i = {}
         for r in results:
@@ -157,7 +195,12 @@ def enrich(items, budget=DEFAULT_BUDGET):
                 "str": r.get("str"),
             }
             done += 1
-    _save()
+    if any_ok:
+        # 服务本身正常时,单条被拒的记个墓碑,以后主轮/补救轮都不再提交它(整体故障时不记,免得全被标死)
+        for k in rejected:
+            cache[k] = {"fin": True, "rejected": True}
+    if done or (any_ok and rejected):
+        _save()                                  # 没新结果就不重写整份缓存(原来每轮都写 21MB)
     # apply cache to items
     for it in items:
         r = cache.get(it["id"])

@@ -15,6 +15,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
+import atomicio
+import health
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WATCH_FILE = os.path.join(BASE_DIR, "x_watch.json")
 STATE_FILE = os.path.join(BASE_DIR, "data", "x_state.json")
@@ -56,20 +59,12 @@ def _accounts():
 
 
 def _load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    s = atomicio.read_json(STATE_FILE, {})
+    return s if isinstance(s, dict) else {}
 
 
 def _save_state(s):
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f)
-    except Exception as e:
-        print("[xfetch] state save error:", e)
+    atomicio.write_json(STATE_FILE, s)          # 原子写:水位文件坏了会回退到只看 30 分钟
 
 
 def _call(query, cursor=""):
@@ -158,7 +153,9 @@ def fetch_x():
                 cursor = d["next_cursor"]
     except Exception as e:
         print("[xfetch] fetch error:", e)
+        health.note_error("twitterapi", e)   # 402 余额用完等:连续失败 -> 告警
         return []                       # 失败不推进水位,下轮重试
+    health.note_ok("twitterapi")
     state["last_since_time"] = max(since, now_ts - OVERLAP_SEC)
     _save_state(state)
     if items:

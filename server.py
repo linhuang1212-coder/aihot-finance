@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import atomicio
 import zhvariant
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,10 +82,10 @@ def load_cache():
 
 
 def save_cache(items):
+    """原子写 items.json(不再 indent:48MB 每 5 分钟整写,缩进只增体积)。"""
     clean = [{k: v for k, v in it.items() if not k.startswith("_")} for it in items]
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
+    if not atomicio.write_json(DATA_FILE, clean):
+        raise OSError("items.json 保存失败")
 
 
 def refresh(verbose=True):
@@ -183,8 +184,72 @@ def _bg_refresh(first_refresh=True):
         refresh(verbose=True)
         print("  数据: %d 条" % len(ITEMS))
     while True:
+        after_refresh()
         time.sleep(REFRESH_SECONDS)
         refresh(verbose=True)
+
+
+BACKUP_DIR = os.path.join(BASE_DIR, "data", "backups")
+_last_daily = None
+_maintenance_enabled = False     # main() 里才打开:测试调 _bg_refresh 也碰不到生产 data/
+
+
+def after_refresh():
+    """每轮 refresh 之后的维护,只在正式启动的后台循环里跑(refresh() 本身不碰):
+    ① 补救翻译/增强失败的 X 条目;② 付费服务连续失败(402 欠费等)-> 告警(送达才记账,
+    发不出去下一轮重发);③ 每天一次:news.db 快照 + 清掉 LLM 缓存里已出窗口的条目
+    (快照失败下一轮再试)。每步独立兜底,互不影响。"""
+    global _last_daily
+    if not _maintenance_enabled:
+        return
+    try:
+        _repair_round()
+    except Exception as e:
+        print("[repair] failed:", e)
+    try:
+        import health
+        import notify
+        for service, state, msg in health.evaluate():
+            if notify.send_alert(msg):
+                health.mark(service, state)
+    except Exception as e:
+        print("[health] failed:", e)
+    today = datetime.now(CST).date().isoformat()
+    if _last_daily != today:
+        try:
+            import store
+            p = store.backup(BACKUP_DIR)
+            if p:
+                print("[backup] %s" % p)
+            _last_daily = today
+        except Exception as e:
+            print("[backup] failed:", e)
+        try:
+            import llm
+            n = llm.prune(it["id"] for it in ITEMS)
+            if n:
+                print("[llm] 缓存清掉 %d 条已出窗口的" % n)
+        except Exception as e:
+            print("[llm] prune failed:", e)
+
+
+def _repair_round():
+    import store
+    import newsfetch
+    fixed = newsfetch.repair_items(store.repair_candidates(exclude=newsfetch.repair_exhausted()))
+    if not fixed:
+        return
+    store.apply_repairs(fixed)
+    by_id = {it["id"]: it for it in fixed}
+    for it in ITEMS:                         # 工作集就地更新,不等下一轮 refresh
+        f = by_id.get(it.get("id"))
+        if f:
+            for k in ("title_zh", "summary_zh", "sentiment", "llm_importance", "categories",
+                      "verified", "score", "selected", "heat"):
+                if k in f:
+                    it[k] = f[k]
+            newsfetch._tag_mainline(it)
+    print("[repair] 补救 %d 条(翻译/情绪)" % len(fixed))
 
 
 def item_date(it):
@@ -551,7 +616,11 @@ class Server(ThreadingHTTPServer):
 def main():
     print("AIHOT 金融板块 · 本地版（实时真实数据）")
     print("  正在抓取真实信源（金十 + X/Twitter KOL）…")
+    global _maintenance_enabled
     import store
+    import health
+    health.enable()                      # 只有正式启动才记录付费服务健康(测试导入不产生副作用)
+    _maintenance_enabled = True
     store.init_db()
     migrated = store.migrate_from_json(DATA_FILE)
     if migrated:

@@ -22,6 +22,8 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
 
+import atomicio
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRANS_FILE = os.path.join(BASE_DIR, "data", "translations.json")
 CST = timezone(timedelta(hours=8))
@@ -175,68 +177,76 @@ def _http_get(url, headers=None, timeout=15):
 # ---------- 免费翻译（Google gtx，无需 key，需 VPN）+ 本地缓存 ----------
 _TRANS_CACHE = None
 _trans_budget = 0
+_trans_dirty = False        # 本轮有新译文 -> 才重写 translations.json
+_trans_fail = 0             # 本轮连续失败次数(熔断用)
+TRANS_FAIL_BREAK = 2        # 连续失败这么多次 -> 本轮剩下的都不再调(DeepSeek 故障时一轮曾被拖 16 分钟)
 
 
 def _load_trans():
     global _TRANS_CACHE
     if _TRANS_CACHE is None:
-        try:
-            with open(TRANS_FILE, encoding="utf-8") as f:
-                _TRANS_CACHE = json.load(f)
-        except Exception:
+        _TRANS_CACHE = atomicio.read_json(TRANS_FILE, {})
+        if not isinstance(_TRANS_CACHE, dict):
             _TRANS_CACHE = {}
     return _TRANS_CACHE
 
 
 def _save_trans():
-    if _TRANS_CACHE is None:
+    global _trans_dirty
+    if _TRANS_CACHE is None or not _trans_dirty:
         return
-    try:
-        os.makedirs(os.path.dirname(TRANS_FILE), exist_ok=True)
-        with open(TRANS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_TRANS_CACHE, f, ensure_ascii=False)
-    except Exception as e:
-        print("[trans] save error:", e)
+    if atomicio.write_json(TRANS_FILE, _TRANS_CACHE):   # 原子写;本轮没新译文就不重写
+        _trans_dirty = False
+
+
+def reset_translate_round():
+    """每轮开始时调用:清零本轮预算和熔断计数。"""
+    global _trans_budget, _trans_fail
+    _trans_budget = 0
+    _trans_fail = 0
 
 
 def translate(text, budget_max=220):
-    """英文->中文。命中缓存直接返回；超出本轮预算或失败则原样返回（下轮再补）。
-    缓存持久化到 data/translations.json，所以同一标题永远只翻一次。"""
-    global _trans_budget
+    """英文->中文。命中缓存直接返回；超出本轮预算、熔断或失败则原样返回（下轮/补救轮再补）。
+    缓存持久化到 data/translations.json，所以同一标题永远只翻一次。
+    失败也计入预算;连续失败 TRANS_FAIL_BREAK 次后本轮熔断(不再逐条等超时)。"""
+    global _trans_budget, _trans_dirty, _trans_fail
     text = (text or "").strip()
     if not text:
         return text
     cache = _load_trans()
     if text in cache:
         return cache[text]
-    if _trans_budget >= budget_max:
+    if _trans_budget >= budget_max or _trans_fail >= TRANS_FAIL_BREAK:
         return text
+    _trans_budget += 1
+    zh = ""
     # TRANSLATE_BACKEND=deepseek：直接走 DeepSeek(跳过 Google,免掉限流/被墙/超时);
     # 不设则默认用 Google 免费翻译。
     if os.environ.get("TRANSLATE_BACKEND") == "deepseek":
         try:
             import llm
             zh = (llm.translate(text) or "").strip()
-            if zh:
-                cache[text] = zh
-                _trans_budget += 1
-                return zh
         except Exception as e:
             print("[trans] deepseek error:", e)
-        return text   # DeepSeek 失败:原样返回,下轮再试
-    try:
-        u = ("https://translate.googleapis.com/translate_a/single?client=gtx"
-             "&sl=auto&tl=zh-CN&dt=t&q=" + urllib.parse.quote(text))
-        d = json.loads(_http_get(u, timeout=10))
-        zh = "".join(seg[0] for seg in d[0] if seg and seg[0]).strip()
-        time.sleep(0.05)  # 轻微节流，避免触发限频
-        if zh:
-            cache[text] = zh
-            _trans_budget += 1
-            return zh
-    except Exception as e:
-        print("[trans] error:", e)
-    return text
+    else:
+        try:
+            u = ("https://translate.googleapis.com/translate_a/single?client=gtx"
+                 "&sl=auto&tl=zh-CN&dt=t&q=" + urllib.parse.quote(text))
+            d = json.loads(_http_get(u, timeout=10))
+            zh = "".join(seg[0] for seg in d[0] if seg and seg[0]).strip()
+            time.sleep(0.05)  # 轻微节流，避免触发限频
+        except Exception as e:
+            print("[trans] error:", e)
+    if zh:
+        cache[text] = zh
+        _trans_dirty = True
+        _trans_fail = 0
+        return zh
+    _trans_fail += 1
+    if _trans_fail == TRANS_FAIL_BREAK:
+        print("[trans] 连续失败 %d 次,本轮熔断,剩余条目下轮/补救轮再翻" % _trans_fail)
+    return text   # 失败:原样返回
 
 
 def fetch_sina(pages=2):
@@ -656,6 +666,14 @@ def fetch_rss(url, default_source):
 
 
 # ---------- B. 信源分级 + 降噪 ----------
+# 隐身源:金十只喂「A 股个股栏」(主流视图隐藏、不增强、不推送,见 2026-06-27)。
+HIDDEN_SOURCE = "金十"
+
+
+def is_hidden(it):
+    return it.get("source") == HIDDEN_SOURCE
+
+
 def _source_tier(src):
     if src in SOURCE_TIER1:
         return 1
@@ -671,11 +689,91 @@ def _all_text(it):
     ]).lower()
 
 
+# ---------- 主线(「主线·算力景气」专栏)判定 ----------
+# 供需类宽泛词:单独出现太泛(豆腐涨价、欧盟柴油短缺都会命中),须同时有产业上下文。
+MAINLINE_SUPPLY = {"涨价", "提价", "缺货", "紧缺", "短缺", "供不应求", "涨价潮", "缺口", "停产",
+                   "减产", "shortage", "price hike", "产能", "扩产", "漲價", "缺貨", "產能",
+                   "調漲", "漲幅", "调涨", "涨幅", "擴產", "price increase"}
+MAINLINE_INDUSTRY = [
+    "电子", "電子", "元件", "零部件", "材料", "铜", "銅", "电力", "電力", "电价", "电网", "電網",
+    "变压器", "變壓器", "电容", "被动元件", "被動元件", "面板", "基板", "硅", "矽", "稀土", "镓",
+    "锗", "钨", "铜箔", "覆铜板", "玻纤", "树脂", "电池", "锂", "晶", "芯", "存储", "服务器",
+    "显卡", "gpu",
+    "electronic", "component", "copper", "power grid", "silicon", "wafer",
+]
+# 泛科技词:单独出现多是游戏/消费电子新闻(显卡驱动、游戏安装体积、Switch 服务器),须有 AI/算力上下文。
+MAINLINE_TECH = {"gpu", "显卡", "顯卡", "服务器", "伺服器", "存储", "cpu", "ssd"}
+MAINLINE_COMPUTE = ["人工智能", "ai", "大模型", "训练", "推理", "集群", "算力", "数据中心",
+                    "data center", "datacenter", "hyperscaler", "云厂商", "智算"]
+# 游戏/消费电子否决词:出现且没有强信号(涨价/缺货/算力/数据中心…)时不算主线——
+# 英伟达、AMD 的游戏显卡新闻会点名厂商,不否决就会被核心词带进主线(Pirat Nation 36->79 条)。
+MAINLINE_GAMING_VETO = ["游戏", "dlss", "geforce", "game ready", "驱动程序", "配置要求",
+                        "系统需求", "system requirement", "steam", "xbox", "playstation", "ps5",
+                        "ps6", "switch 2", "任天堂", "nintendo", "帧生成", "光线追踪", "模组",
+                        "rtx", "radeon", "显卡驱动"]
+MAINLINE_STRONG = ["数据中心", "data center", "datacenter", "算力", "ai服务器", "ai server",
+                   "hbm", "hyperscaler", "训练", "推理", "集群", "涨价", "提价", "上调", "调涨",
+                   "短缺", "缺货", "供不应求", "停产", "减产", "产能", "shortage", "price hike",
+                   "price increase"]
+# 整个账号就是做半导体/算力链的分析师:发什么都算主线(内容常是集群测试、LPDDR 路线图这类
+# 专业话题,标题里未必有关键词)。按 x_watch.json 的 label。
+MAINLINE_SOURCES = {"X·SemiAnalysis", "X·TrendForce", "X·Dan Nystedt", "X·DIGITIMES Asia",
+                    "X·郭明錤"}
+# 算力链核心词:命中即主线(游戏否决除外)。THEME_KW 里除宽泛词外的全部 + 补齐的链上关键词
+# (2026-09-29 实测主线栏漏了台积电/TSMC/DRAM 等)。不收裸"核电"(扎波罗热核电站战争新闻)、
+# 裸"十五五"、裸"三星"(手机新闻多)、"a16"(撞 a16z)。
+MAINLINE_CORE = [k for k in THEME_KW if k not in MAINLINE_SUPPLY and k not in MAINLINE_TECH] + [
+    "英伟达", "輝達", "黄仁勋", "黃仁勳", "台积电", "台積電", "台积", "台積", "海力士", "美光",
+    "博通", "迈威尔", "阿斯麦", "光刻机", "芯片", "晶片", "半导体", "内存", "闪存",
+    "快閃記憶體", "显存", "智算", "光通信", "硅光", "矽光", "光芯片", "激光器", "tsmc", "avgo",
+    "电路板", "印制电路", "人工智能基础设施", "ai基础设施", "算力基础设施", "circuit board",
+    "ai infrastructure", "lpddr", "ddr4", "ddr5", "gddr", "mlcc",
+    "nvidia", "hynix", "micron", "broadcom", "marvell", "asml", "amd", "dram", "nand",
+    "semiconductor", "chipmaker", "data center", "datacenter", "hyperscaler", "ai chip",
+    "ai server", "stargate", "blackwell", "rubin",
+]
+_ASCII_KW_RE = {}
+
+
+def _kw_hit(k, text):
+    """中文词子串匹配;英文词左边不能紧挨字母数字、右边不能紧挨字母(可带复数 s,可接型号数字
+    如 lpddr6/ddr5),免得 amd 命中 Hamdan、dram 命中 drama、nand 命中 Ananda。"""
+    if not k.isascii():
+        return k in text
+    r = _ASCII_KW_RE.get(k)
+    if r is None:
+        r = _ASCII_KW_RE[k] = re.compile(r"(?<![a-z0-9])%s(?:s|es)?(?![a-z])" % re.escape(k))
+    return bool(r.search(text))
+
+
+def _mainline_text(it):
+    """只用原始信息:标题/原文/正文/连发分段。不用 LLM 摘要——它按提示词要写
+    「利好××产业链」这类推断,原文没提的主线词会混进来(实测主线栏 56% 靠摘要命中)。"""
+    return " ".join([
+        it.get("title_zh") or "", it.get("title_orig") or "", it.get("body_excerpt") or "",
+        " ".join(it.get("segments") or []),
+    ]).lower()
+
+
 def _tag_mainline(it):
-    """命中任一主线词(THEME_KW = 用户 AI 算力链词表)-> it["mainline"]=True。
-    供网页「主线」专栏筛选;一套词既调 _score 加权又当筛子。"""
-    text = _all_text(it)                       # 已 lower
-    it["mainline"] = any(k in text for k in THEME_KW)
+    """算力链主线判定 -> it["mainline"],供网页「主线」专栏筛选。依次:
+    DIGITIMES 涨价追踪/链上分析师整源算 -> 游戏消费电子否决 -> 自选标的实体 -> 核心词 ->
+    供需词+产业上下文 / 泛科技词+AI算力上下文。"""
+    src = it.get("source") or ""
+    if src.startswith("DIGITIMES") or src in MAINLINE_SOURCES:
+        it["mainline"] = True
+        return
+    text = _mainline_text(it)
+    hit = lambda kws: any(_kw_hit(k, text) for k in kws)
+    if hit(MAINLINE_GAMING_VETO) and not hit(MAINLINE_STRONG):
+        it["mainline"] = False
+        return
+    if any(e.get("name") in WATCHLIST_NAMES for e in (it.get("entities") or [])):
+        it["mainline"] = True
+        return
+    it["mainline"] = (hit(MAINLINE_CORE)
+                      or (hit(MAINLINE_SUPPLY) and hit(MAINLINE_INDUSTRY))
+                      or (hit(MAINLINE_TECH) and hit(MAINLINE_COMPUTE)))
 
 
 def _is_china_related(it):
@@ -815,7 +913,38 @@ def _merge_entities(a, b):
 
 
 def _cluster(items, threshold=0.5):
-    """items 按时间倒序。标题字符二元组 Jaccard >= threshold 且 24h 内 -> 同一事件。"""
+    """items 按时间倒序。标题字符二元组 Jaccard >= threshold 且 24h 内 -> 同一事件。
+    隐身源(金十)和可见源分开聚:金十不能当可见事件的代表——否则同事件的 X 条目被吞、
+    整件事从主流视图消失,传播计数也挂在看不见的条目上。同事件的金十只把自己计进
+    可见代表的 also_sources/dup_count(算印证与传播),自身照常保留给个股栏。"""
+    vis = _cluster_one([it for it in items if not is_hidden(it)], threshold)
+    hid = _cluster_one([it for it in items if is_hidden(it)], threshold)
+    vis_feats = [(_title_features(r), _parse_dt(r), r) for r in vis]
+    for h in hid:
+        hf, hdt = _title_features(h), _parse_dt(h)
+        if not hf:
+            continue
+        for rf, rdt, r in vis_feats:
+            if hdt and rdt and abs((hdt - rdt).total_seconds()) > 86400:
+                continue
+            if rf and len(hf & rf) / len(hf | rf) >= threshold:
+                srcs = r.setdefault("also_sources", [r.get("source", "")])
+                for s in h.get("also_sources") or [h.get("source", "")]:
+                    if s and s not in srcs:
+                        srcs.append(s)
+                        r["dup_count"] = r.get("dup_count", 1) + 1
+                break
+    return vis + hid
+
+
+def _parse_dt(it):
+    try:
+        return datetime.fromisoformat(it["published_at"])
+    except Exception:
+        return None
+
+
+def _cluster_one(items, threshold):
     reps = []
     for it in items:
         f = _title_features(it)
@@ -900,8 +1029,7 @@ def _heat_tier(dup_count, base=""):
 
 
 def fetch_all():
-    global _trans_budget
-    _trans_budget = 0
+    reset_translate_round()
     # 信源(2026-06-26 pivot)：主流 = DIGITIMES 涨价大追踪 + X(KOL)。华尔街见闻/东方财富/RSS
     # 的 fetch 函数全部保留但不再调用（「留函数不调用」先例，方便日后再开）。
     # 金十仍抓,但仅作「个股(A股)栏」的喂料：标 stock_only,不进主流/不推送(见下方打分循环)。
@@ -922,7 +1050,7 @@ def fetch_all():
     try:                                                 # LLM 增强（可选，自动跳过）
         import llm
         # 金十只喂「个股(A股)栏」,用不到增强(情绪/重要度)-> 跳过,省 DeepSeek 约 2/3
-        n = llm.enrich([it for it in reps if it.get("source") != "金十"])
+        n = llm.enrich([it for it in reps if not is_hidden(it)])
         if n:
             print("[llm] enriched %d new items" % n)
     except Exception as e:
@@ -931,23 +1059,93 @@ def fetch_all():
     for it in reps:                                      # C 打分 + 精选判定
         if it.get("llm_fin") is False:                   # LLM 判定非财经 -> 丢弃
             continue
-        if it.get("llm_importance") is not None:
-            imp = float(it["llm_importance"])
-            s = imp + min((it.get("dup_count", 1) - 1) * 0.5, 3.0)
-            if it.get("entities"):
-                s += 1.0
-            s += _sentiment_boost(it)                    # 强方向+自选标的加权
-            it["score"], it["selected"] = round(s, 2), imp >= 6
-        else:
-            it["score"], it["selected"] = _score(it)
-        if it.get("source") == "金十":
-            # 金十只喂「个股(A股)栏」:强制不选中 -> 不进精选/主线、不推 Telegram;
-            # server.refresh 据 source 派生 stock_only,filter_items 只在个股视图放行。
-            it["selected"] = False
-        it["heat"] = _heat_tier(it.get("dup_count", 1), it.get("heat") or "")
+        _finalize(it)
         out.append(it)
     out.sort(key=lambda x: x["published_at"], reverse=True)
     return out
+
+
+_CJK_RE = re.compile(r"[一-鿿]")
+_repair_tries = {}          # id -> DeepSeek 正常应答却仍没修好的次数(进程内);到上限就不再试
+REPAIR_MAX_TRIES = 3
+REPAIR_BATCH = 30           # 每轮最多补救几条
+
+
+def repair_exhausted():
+    """已用完补救次数的 id(候选阶段排除,免得它们一直占着每轮的名额)。"""
+    return {k for k, v in _repair_tries.items() if v >= REPAIR_MAX_TRIES}
+
+
+def repair_items(rows):
+    """补救轮:给翻译失败(标题仍是英文)/增强失败(没有情绪)的 X 条目重试。
+    X 推文只抓一次,那一轮 DeepSeek 故障就永远是英文标题、没有情绪(09-15 故障留下 76 条)。
+    只有 DeepSeek 本轮正常应答、条目却仍没修好才计一次失败——故障/熔断的轮次不计,
+    否则故障持续 15 分钟以上,恢复后就一条也补不回来了。
+    返回改好的条目(字段已就地更新并重新打分),调用方负责写库。"""
+    import llm
+    if _trans_fail >= TRANS_FAIL_BREAK:
+        return []                  # 主抓取轮刚熔断 = DeepSeek 正在故障:这轮不补,也不白等超时
+    reset_translate_round()
+    todo = [it for it in rows if _repair_tries.get(it["id"], 0) < REPAIR_MAX_TRIES][:REPAIR_BATCH]
+    changed = {}
+    for it in todo:
+        title = it.get("title_zh") or ""
+        if _CJK_RE.search(title):
+            continue
+        orig = (it.get("title_orig") or it.get("body_excerpt") or "")[:300]
+        zh = translate(orig)
+        if zh and _CJK_RE.search(zh):
+            if not it.get("summary_zh") or it.get("summary_zh") == title:
+                it["summary_zh"] = zh[:120]
+            it["title_zh"] = zh[:120]
+            changed[it["id"]] = it
+    _save_trans()
+    api_down = _trans_fail >= TRANS_FAIL_BREAK
+    need = [it for it in todo if not it.get("sentiment")]
+    if need and llm.enabled():
+        # 已在缓存里的也交给 enrich:它不会重复调 API,但会把缓存里的情绪/重要度补到条目上
+        uncached = [it for it in need if it["id"] not in llm._load()]
+        try:
+            if not llm.enrich(need) and uncached:
+                api_down = True
+        except Exception as e:
+            print("[repair] enrich failed:", e)
+            api_down = True
+        for it in need:
+            if it.get("sentiment"):
+                changed[it["id"]] = it
+    if not api_down:
+        for it in todo:
+            if it["id"] not in changed:
+                _repair_tries[it["id"]] = _repair_tries.get(it["id"], 0) + 1
+        if len(_repair_tries) > 5000:             # 进程常驻:别无限长
+            for k in list(_repair_tries)[:len(_repair_tries) - 5000]:
+                del _repair_tries[k]
+    out = []
+    for it in changed.values():
+        _finalize(it)
+        if it.get("llm_fin") is False:
+            it["selected"] = False
+        out.append(it)
+    return out
+
+
+def _finalize(it):
+    """打分 + 精选判定 + 热度档(fetch_all 与补救轮共用)。"""
+    if it.get("llm_importance") is not None:
+        imp = float(it["llm_importance"])
+        s = imp + min((it.get("dup_count", 1) - 1) * 0.5, 3.0)
+        if it.get("entities"):
+            s += 1.0
+        s += _sentiment_boost(it)                        # 强方向+自选标的加权
+        it["score"], it["selected"] = round(s, 2), imp >= 6
+    else:
+        it["score"], it["selected"] = _score(it)
+    if is_hidden(it):
+        # 金十只喂「个股(A股)栏」:强制不选中 -> 不进精选/主线、不推 Telegram;
+        # server.refresh 据 source 派生 stock_only,filter_items 只在个股视图放行。
+        it["selected"] = False
+    it["heat"] = _heat_tier(it.get("dup_count", 1), it.get("heat") or "")
 
 
 if __name__ == "__main__":

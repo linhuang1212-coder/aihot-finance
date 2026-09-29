@@ -10,12 +10,14 @@ AIHOT 金融板块 · Telegram 机器人（长轮询 + 自动推送，零依赖�
 
 import json
 import os
+import re
 import time
 import threading
 import urllib.request
 import urllib.parse
 from datetime import datetime
 
+import atomicio
 import market
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -83,10 +85,13 @@ _LOCK = threading.Lock()
 
 
 def _load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            s = json.load(f)
-    except Exception:
+    # 读坏(半截文件)时改名留底并回退到上一份 .prev——原来直接当空表,订阅者清空、推送悄悄停
+    s = atomicio.read_json(STATE_FILE, None, try_prev=True)
+    if s is None and os.path.exists(STATE_FILE):
+        # 文件在但读不出来(被占用等),.prev 也不行:宁可退出让 run.py 重启重读,
+        # 也不能带着空订阅列表跑起来——下一次保存就会把真实订阅者覆盖掉
+        raise SystemExit("bot_state.json 暂时读不了,退出等守护进程重启")
+    if not isinstance(s, dict):
         s = {}
     s.setdefault("subscribers", [])
     s.setdefault("seen", [])
@@ -100,11 +105,7 @@ STATE = _load_state()
 
 
 def _save_state():
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, ensure_ascii=False)
-    except Exception as e:
-        print("[state] save error:", e)
+    atomicio.write_json(STATE_FILE, STATE, keep_prev=True)
 
 
 # ---------------- http ----------------
@@ -235,6 +236,11 @@ def render_daily(d):
     return "\n\n".join(out)   # 块间空一行（用户 2026-06-12 要求,与推送卡片排版一致）
 
 
+def _is_chinese(text):
+    t = re.sub(r"https?://\S+|\s+", "", text or "")
+    return bool(t) and len(re.findall(r"[一-鿿]", t)) / len(t) >= 0.3
+
+
 def render_push_item(it):
     """单条独立推送（贴图版结构，用户 2026-06-10 指定）：
         📊 快讯捕捉 | 来源: X        (有热度 -> 末尾 🔥)
@@ -249,7 +255,9 @@ def render_push_item(it):
     s = it.get("sentiment") or {}
     title_zh = it.get("title_zh", "")
     orig = (it.get("title_orig") or "").strip()
-    translated = bool(orig) and orig != title_zh   # 英文源译过 -> 有原文可展示
+    # 英文源译过 -> 有原文可展示;原文本身是中文(中文 X 账号,DeepSeek 只是改写/繁转简)不算翻译,
+    # 否则卡片会多出一段和标题几乎一样的「🔤原文」
+    translated = bool(orig) and orig != title_zh and not _is_chinese(orig)
 
     head = "📊 <b>快讯捕捉</b> | 来源: " + esc(it.get("source", ""))
     if it.get("heat"):

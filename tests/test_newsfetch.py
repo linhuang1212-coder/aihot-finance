@@ -77,6 +77,7 @@ class TestFetchAllSources(unittest.TestCase):
     def test_digitimes_x_jin10_wired_rest_dropped(self):
         import newsfetch as nf
         import xfetch
+        import llm
         called = []
         patches = [
             mock.patch.object(nf, "fetch_wscn", side_effect=lambda *a, **k: called.append("wscn") or []),
@@ -86,6 +87,8 @@ class TestFetchAllSources(unittest.TestCase):
             mock.patch.object(nf, "fetch_rss", side_effect=lambda *a, **k: called.append("rss") or []),
             mock.patch.object(nf, "_save_trans"),                       # 别动真翻译缓存
             mock.patch.object(xfetch, "fetch_x", side_effect=lambda *a, **k: called.append("x") or []),
+            # 原来漏 mock:在生产目录跑测试时 enrich 会加载并整份重写真实的 llm_cache.json
+            mock.patch.object(llm, "enrich", return_value=0),
         ]
         for p in patches:
             p.start()

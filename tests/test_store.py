@@ -146,10 +146,18 @@ class TestMentions(unittest.TestCase):
 
     def test_group_skip_still_records_mention(self):
         self.store.upsert_items([_item("a", group="g1")])
-        self.store.upsert_items([_item("b", group="g1", source="金十",
+        self.store.upsert_items([_item("b", group="g1", source="CNBC",
                                        title_zh="完全不同的另一个标题写法")])
         self.assertEqual(len(self.store.recent_items()), 1)   # 条目仍跳过
         self.assertEqual(len(self._mentions("g1")), 2)        # 但提及记到 2 家
+
+    def test_group_collision_across_hidden_source_keeps_both(self):
+        # 2026-09-29:金十(只喂个股栏)与可见源同组不再互吞——金十照常入库,提及计给可见事件
+        self.store.upsert_items([_item("a", group="g1")])
+        self.store.upsert_items([_item("b", group="g1", source="金十",
+                                       title_zh="完全不同的另一个标题写法")])
+        self.assertEqual(len(self.store.recent_items()), 2)
+        self.assertEqual(len(self._mentions("g1")), 2)
 
     def test_similar_title_skip_records_to_matched_group(self):
         self.store.upsert_items([_item("a", group="g1",
