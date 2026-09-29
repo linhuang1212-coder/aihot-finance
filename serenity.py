@@ -10,6 +10,8 @@ DeepSeek key 复用 llm.py。缓存按 (标的,当天) 存 data/analysis_cache.j
 import os
 import re
 import json
+import time
+import threading
 import concurrent.futures
 import urllib.request
 import urllib.parse
@@ -32,6 +34,13 @@ CONTEXT_ITEMS = 12
 DEEP_RESEARCH = os.environ.get("ANALYSIS_DEEP", "on").lower() != "off"
 ARTICLE_MAX = 3          # 抓几篇正文
 ARTICLE_CHARS = 1500     # 每篇正文截断字数
+# 每天最多新生成几次:成功的按 analysis_cache.json 里当天的 key 计(重启不清零),
+# 失败的(DeepSeek 欠费/故障时每次仍会去抓 Google News/DDG/正文)按进程内计数一起算。命中缓存不算。
+DAILY_MAX = int(os.environ.get("ANALYSIS_DAILY_MAX", "20"))
+DEADLINE = int(os.environ.get("ANALYSIS_DEADLINE", "240"))   # 单次 DeepSeek 调用总时长上限(秒)
+ENTITY_MAX_LEN = 30
+_GEN_LOCK = threading.Lock()
+_FAILS = {}                  # {日期: 当天生成失败次数},只在持锁时读写
 # 须与 analysis_pack.md 结尾的免责语逐字一致（analyze 用子串判断避免重复追加）
 DISCLAIMER = "本分析为框架推理，非投资建议；不预测点位。来源真实 ≠ 内容已证实。"
 
@@ -67,13 +76,31 @@ def build_context(entity, items):
             "sources": sources, "count": len(rel), "items": rel}
 
 
-def _get_bytes(url, timeout=10, data=None, headers=None):
+def _read_capped(r, deadline, max_bytes=None):
+    """分块读响应,超过总时限就抛 TimeoutError。urlopen 的 timeout 只管单次 socket 读:
+    对端每隔几秒吐一点(DeepSeek 排队时会持续发空行,官方说最长 10 分钟)就永远不超时,
+    而深度分析是持锁生成的,卡住期间网页和 /serenity 全部 busy。"""
+    chunks, n = [], 0
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("response exceeded deadline")
+        b = r.read1(65536)
+        if not b:
+            break
+        chunks.append(b)
+        n += len(b)
+        if max_bytes and n >= max_bytes:
+            break
+    return b"".join(chunks)
+
+
+def _get_bytes(url, timeout=10, data=None, headers=None, max_bytes=2_000_000):
     h = {"User-Agent": UA}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        return _read_capped(r, time.monotonic() + timeout * 3, max_bytes)
 
 
 def fetch_supplement(entity, limit=6):
@@ -228,6 +255,13 @@ def _load_cache():
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
             return json.load(f)
+    except ValueError:
+        # 文件坏了(半截写入):改名留底再从空开始,别让下一次保存把历史分析整份覆盖掉
+        try:
+            os.replace(CACHE_FILE, CACHE_FILE + ".corrupt-%s" % datetime.now(CST).strftime("%Y%m%d%H%M%S"))
+        except OSError:
+            pass
+        return {}
     except Exception:
         return {}
 
@@ -235,8 +269,10 @@ def _load_cache():
 def _save_cache(cache):
     try:
         os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)          # 原子替换:断电/被杀也不会留下半截文件
     except Exception as e:
         print("[serenity] cache save error:", e)
 
@@ -252,9 +288,10 @@ def _deepseek(system, user):
     }).encode("utf-8")
     req = urllib.request.Request(API_URL, data=body, headers={
         "Authorization": "Bearer " + key, "Content-Type": "application/json"})
-    # 深度分析生成较慢（~30–60s），超时给到 90s；bot 侧 fetch_analysis 用 95s 略大于它
+    # 生成一般 30–60s。timeout=90 是单次 socket 读超时;整次调用另有 DEADLINE 硬上限
+    # (DeepSeek 拥堵时持续发空行,单次读永远不超时)。bot 侧 fetch_analysis 的 HTTP 超时是 120s。
     with urllib.request.urlopen(req, timeout=90) as r:
-        d = json.loads(r.read())
+        d = json.loads(_read_capped(r, time.monotonic() + DEADLINE))
     return d["choices"][0]["message"]["content"]
 
 
@@ -269,6 +306,9 @@ def analyze(entity, items):
     entity = (entity or "").strip()
     if not entity:
         return _err(entity, "no_data", "用法：/serenity 英伟达")
+    if len(entity) > ENTITY_MAX_LEN:
+        return _err(entity[:ENTITY_MAX_LEN], "bad_request",
+                    "标的名太长（最多 %d 个字）。" % ENTITY_MAX_LEN)
     if not llm.enabled():
         return _err(entity, "no_llm", "未配置分析能力（DeepSeek key）。")
     ctx = build_context(entity, items)
@@ -280,6 +320,34 @@ def analyze(entity, items):
     if ckey in cache:
         return {**cache[ckey], "cached": True}
 
+    # 往下要花钱(DeepSeek + 外部抓取)。/api/analysis 经 fblerp.com/news 公网匿名可达,
+    # 且子串匹配让几乎任意短串都能命中条目 -> 同时只生成一个 + 每天限额,防被刷费用。
+    # 拿不到锁直接回 busy,不排队(排队会让请求线程和隧道连接一起堆积)。
+    if not _GEN_LOCK.acquire(blocking=False):
+        return _err(entity, "busy", "另一个深度分析正在生成，请稍后再试。",
+                    ctx["sources"], ctx["based_on"])
+    try:
+        cache = _load_cache()           # 拿到锁后重读:可能刚被上一个请求生成好
+        if ckey in cache:
+            return {**cache[ckey], "cached": True}
+        today = _today()
+        used = sum(1 for k in cache if k.endswith("@" + today)) + _FAILS.get(today, 0)
+        if used >= DAILY_MAX:
+            return _err(entity, "quota",
+                        "今日深度分析次数已用完（每天 %d 次），明天再试。" % DAILY_MAX,
+                        ctx["sources"], ctx["based_on"])
+        result = _generate(entity, ctx, cache, ckey)
+        if result.get("status") != "ok":
+            for d in [d for d in _FAILS if d != today]:
+                del _FAILS[d]
+            _FAILS[today] = _FAILS.get(today, 0) + 1
+        return result
+    finally:
+        _GEN_LOCK.release()
+
+
+def _generate(entity, ctx, cache, ckey):
+    """真正生成一次分析(付费),成功则写入 cache[ckey]。调用方须持有 _GEN_LOCK。"""
     supp = fetch_supplement(entity)
     supp_text = "\n".join("- %s（%s）" % (s["title"], s["source"]) for s in supp) or "（无补充）"
     research = _gather_research(entity, ctx["items"])

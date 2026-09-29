@@ -6,19 +6,26 @@ AIHOT 金融板块 · 本地版
 然后浏览器打开 http://localhost:8910
 """
 
+import gzip
+import hashlib
 import json
 import os
 import re
+import sys
 import time
 import threading
+import traceback
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+import zhvariant
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data", "items.json")
 PUBLIC_DIR = os.path.join(BASE_DIR, "public")
 PORT = int(os.environ.get("PORT", "8910"))
+CST = timezone(timedelta(hours=8))
 
 CATEGORY_LABELS = [
     ("macro", "宏观·政策"),
@@ -30,6 +37,7 @@ CATEGORY_LABELS = [
 ]
 LABEL_BY_SLUG = dict(CATEGORY_LABELS)
 
+# 静态文件扩展名白名单:不在表里的一律 404(public/ 里的 *.bak-日期 备份、NTFS 流 x.html::$DATA 等)
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
@@ -37,7 +45,17 @@ STATIC_TYPES = {
     ".json": "application/json; charset=utf-8",
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain; charset=utf-8",
 }
+# 这些类型且 >= GZIP_MIN 字节时,客户端声明支持就 gzip(JSON 实测省 ~69%,全走家宽上行 + 隧道)
+_COMPRESSIBLE = ("text/", "application/json", "application/javascript", "image/svg+xml")
+GZIP_MIN = 1024
+# 客户端中途断开(关页面/隧道抖动)或 socket 读写超时(Handler.timeout):不算服务端错误,不打 traceback
+_CLIENT_GONE = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError)
 
 
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "300"))  # 5分钟(2026-07-20 降 twitterapi 轮询成本)
@@ -47,7 +65,10 @@ ITEMS = []
 def _attach_dt(items):
     for it in items:
         try:
-            it["_dt"] = datetime.fromisoformat(it["published_at"])
+            dt = datetime.fromisoformat(it["published_at"])
+            if dt.tzinfo is None:           # 不带时区的按北京时间,免得和带时区的比较时抛 TypeError
+                dt = dt.replace(tzinfo=CST)
+            it["_dt"] = dt
         except Exception:
             it["_dt"] = datetime(1970, 1, 1, tzinfo=timezone.utc)
     items.sort(key=lambda x: x["_dt"], reverse=True)
@@ -177,15 +198,53 @@ def public_item(it):
 
 
 def parse_since(value):
+    """解析 since 参数,总是返回带时区的 datetime(或 None)。
+    - 不带时区 -> 按北京时间(否则和条目时间比较会抛 TypeError,连接直接断、nginx 回 502);
+    - URL 里没编码的 "+08:00" 会被 parse_qs 解成空格 -> 把时间后面那个空格还原成 "+"。"""
     if not value:
         return None
     v = value.strip()
+    v = re.sub(r"(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?) (\d{2}:?\d{2})$", r"\1+\2", v)
+    if v[-1:] in ("Z", "z"):
+        v = v[:-1] + "+00:00"
+    # Python 3.10 的 fromisoformat 只认 +HH:MM 和 3/6 位小数秒(云端是 3.10):先规整
+    v = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", v)
+    v = re.sub(r"\.(\d{1,6})\d*(?=[+-]\d{2}:\d{2}$|$)", lambda m: "." + m.group(1).ljust(6, "0"), v)
     try:
-        if v.endswith("Z"):
-            v = v[:-1] + "+00:00"
-        return datetime.fromisoformat(v)
+        dt = datetime.fromisoformat(v)
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CST)
+    return dt
+
+
+MAX_QUERY_TOKENS = 6
+MAX_TOKEN_LEN = 40
+
+
+def query_patterns(q):
+    """搜索词 -> 正则列表(每个都要命中)。
+    - 含中文:按空白切词(最多 6 个),每个字展开成繁简字符类,
+      所以搜「台积电 涨价」也能命中 DIGITIMES 的繁体「台積電…漲價」;
+    - 纯 ASCII:保持原来的整串短语匹配。英文切词后子串 AND 会大量误命中
+      ("rate cut" 命中 moderate…consecutive),Telegram 里随手发的 "hi there" 也会被当搜索推一堆卡片。"""
+    if not q or not q.strip():
+        return []
+    q = q.strip().lower()
+    if q.isascii():
+        return [re.compile(re.escape(q))]
+    toks = [t for t in re.split(r"\s+", q) if t][:MAX_QUERY_TOKENS]
+    return [re.compile(zhvariant.pattern(t[:MAX_TOKEN_LEN])) for t in toks]
+
+
+def _inside(base, target):
+    """target 是否在 base 目录内。不能用 startswith:'public_backup_x' 也以 'public' 开头。"""
+    try:
+        common = os.path.commonpath([base, target])
+    except ValueError:                      # 跨盘符 / UNC 与本地路径混用
+        return False
+    return os.path.normcase(common) == os.path.normcase(base)
 
 
 def filter_items(qs):
@@ -197,7 +256,7 @@ def filter_items(qs):
     source = qs.get("source", [None])[0]
     stock = qs.get("stock", [None])[0]
     mainline = qs.get("mainline", [None])[0]
-    q = qs.get("q", [None])[0]
+    q_pats = query_patterns(qs.get("q", [None])[0])
     since = parse_since(qs.get("since", [None])[0])
     include_unverified = (qs.get("include_unverified", ["true"])[0]).lower() != "false"
     try:
@@ -244,14 +303,13 @@ def filter_items(qs):
                 continue
         if since and it["_dt"] < since:
             continue
-        if q:
-            qq = q.strip().lower()
+        if q_pats:
             hay = " ".join([
-                it.get("title_zh", ""), it.get("summary_zh", ""),
-                it.get("body_excerpt", ""), " ".join(it.get("tags", [])),
-                " ".join(e.get("name", "") for e in it.get("entities", [])),
+                it.get("title_zh") or "", it.get("summary_zh") or "",
+                it.get("body_excerpt") or "", " ".join(it.get("tags") or []),
+                " ".join(e.get("name") or "" for e in it.get("entities") or []),
             ]).lower()
-            if qq not in hay:
+            if not all(p.search(hay) for p in q_pats):
                 continue
         results.append(it)
 
@@ -298,31 +356,108 @@ def build_daily(channel, date):
     return sections
 
 
+def _now_str():
+    return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
 class Handler(BaseHTTPRequestHandler):
+    # 只管 socket 读写(防慢连接一直占着线程);不限制 /api/analysis 这类慢计算本身
+    timeout = 30
+    _head_only = False
+
     def log_message(self, fmt, *args):
         pass  # quiet
 
-    def _send_json(self, obj, status=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _accepts_gzip(self):
+        for part in (self.headers.get("Accept-Encoding") or "").split(","):
+            name, _, params = part.partition(";")
+            if name.strip().lower() == "gzip":
+                return not re.match(r"(?i)^\s*q\s*=\s*0(?:\.0*)?\s*$", params)
+        return False
+
+    def _etag_matches(self, etag):
+        """If-None-Match 用弱比较:去掉 W/ 前缀再比 opaque-tag。"""
+        inm = self.headers.get("If-None-Match")
+        if not inm:
+            return False
+        if inm.strip() == "*":
+            return True
+        opaque = etag[2:] if etag.startswith("W/") else etag
+        for t in inm.split(","):
+            t = t.strip()
+            if (t[2:] if t.startswith("W/") else t) == opaque:
+                return True
+        return False
+
+    def _send(self, body, ctype, status=200, headers=None):
+        """统一出口:ETag/304、gzip、Cache-Control、HEAD 只发头。"""
+        hdrs = [("X-Content-Type-Options", "nosniff")] + list(headers or [])
+        compressible = ctype.startswith(_COMPRESSIBLE) and len(body) >= GZIP_MIN
+        if compressible:
+            hdrs.append(("Vary", "Accept-Encoding"))
+        if status == 200:
+            # 弱 ETag 按未压缩内容算:gzip/原文两种表示语义相同。no-cache = 可缓存但每次先问,
+            # 没变就 304 不下发正文(前端每 45s 轮询,大多数轮次内容没变)
+            etag = 'W/"%s"' % hashlib.md5(body).hexdigest()[:20]
+            hdrs += [("ETag", etag), ("Cache-Control", "no-cache")]
+            if self._etag_matches(etag):
+                self.send_response(304)
+                for k, v in hdrs:
+                    self.send_header(k, v)
+                self._headers_flushed = True
+                self.end_headers()
+                return
+        if compressible and self._accepts_gzip():
+            body = gzip.compress(body, compresslevel=6, mtime=0)
+            hdrs.append(("Content-Encoding", "gzip"))
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", ctype)
+        for k, v in hdrs:
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
+        self._headers_flushed = True
         self.end_headers()
-        self.wfile.write(body)
+        if not self._head_only:
+            self.wfile.write(body)
+
+    def _send_json(self, obj, status=200, headers=None):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._send(body, "application/json; charset=utf-8", status,
+                   [("Access-Control-Allow-Origin", "*")] + list(headers or []))
 
     def _send_static(self, path):
-        ext = os.path.splitext(path)[1]
-        ctype = STATIC_TYPES.get(ext, "application/octet-stream")
+        ext = os.path.splitext(path)[1].lower()
         with open(path, "rb") as f:
             body = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send(body, STATIC_TYPES[ext])
 
     def do_GET(self):
+        self._head_only = False
+        self._dispatch()
+
+    def do_HEAD(self):
+        self._head_only = True
+        self._dispatch()
+
+    def _dispatch(self):
+        """兜底:任何未预期异常都回 500 JSON,而不是直接断连接(经 nginx 就成了 502)。
+        响应头已经发出去之后再出错,就不能再补一个 500(会被拼进正文),只断开连接。"""
+        self._headers_flushed = False
+        try:
+            self._route()
+        except _CLIENT_GONE:
+            self.close_connection = True
+        except Exception:
+            print("[%s] [http] %s %s 处理异常:\n%s"
+                  % (_now_str(), self.command, self.path, traceback.format_exc()))
+            self.close_connection = True
+            if not self._headers_flushed:
+                try:
+                    self._send_json({"error": "internal error"}, 500)
+                except Exception:
+                    pass
+
+    def _route(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -372,6 +507,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(store.prop_detail(group))
 
         if path == "/api/analysis":
+            if self._head_only:                 # HEAD 不能触发付费生成
+                return self._send_json({"error": "method not allowed"}, 405,
+                                       [("Allow", "GET")])
             entity = qs.get("entity", [None])[0]
             try:
                 import serenity
@@ -388,22 +526,26 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.isfile(skill_path):
                 with open(skill_path, "rb") as f:
                     body = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+                return self._send(body, "text/plain; charset=utf-8")
             return self._send_json({"error": "not found"}, 404)
 
         # ---------- static ----------
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         target = os.path.normpath(os.path.join(PUBLIC_DIR, rel))
-        if not target.startswith(PUBLIC_DIR):
+        if not _inside(PUBLIC_DIR, target):
             return self._send_json({"error": "forbidden"}, 403)
-        if os.path.isfile(target):
+        if os.path.splitext(target)[1].lower() in STATIC_TYPES and os.path.isfile(target):
             return self._send_static(target)
         return self._send_json({"error": "not found", "path": path}, 404)
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        """客户端中途断开(连接被中止/重置)不刷 traceback:server.log 里原来 251/294 条都是这个。"""
+        if isinstance(sys.exc_info()[1], _CLIENT_GONE):
+            return
+        print("[%s] [http] 连接 %s 处理出错:" % (_now_str(), client_address[0]))
+        super().handle_error(request, client_address)
 
 
 def main():
@@ -422,7 +564,7 @@ def main():
     t.start()
     # 默认只绑本机回环(nginx 反代到 127.0.0.1:PORT);要对外可设 HOST=0.0.0.0。
     host = os.environ.get("HOST", "127.0.0.1")
-    ThreadingHTTPServer((host, PORT), Handler).serve_forever()
+    Server((host, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

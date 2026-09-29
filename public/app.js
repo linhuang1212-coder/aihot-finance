@@ -358,20 +358,26 @@ function renderAnalysisView() {
   const out = el("div", "analysis-out");
   list.appendChild(out);
 
+  let seq = 0;   // 只显示最后一次请求的结果：连点/改标的再点时，先回来的旧结果直接丢掉
   function run() {
     const ent = input.value.trim();
     if (!ent) return;
+    const my = ++seq;
     out.innerHTML = '<div class="analysis-loading">正在做深度分析（约半分钟）…</div>';
     fetch(`api/analysis?channel=${CHANNEL}&entity=${encodeURIComponent(ent)}`)
       .then(r => r.json())
       .then(d => {
+        if (my !== seq) return;
         if (d.status === "ok") {
-          out.innerHTML = `<div class="analysis-md">${mdToHtml(d.analysis_md)}</div>`;
+          out.innerHTML = `<div class="analysis-md"><h3>${esc(d.entity || ent)}</h3>${mdToHtml(d.analysis_md)}</div>`;
         } else {
           out.innerHTML = `<div class="analysis-msg">${esc(d.message || "分析暂不可用。")}</div>`;
         }
       })
-      .catch(() => { out.innerHTML = '<div class="analysis-msg">分析失败，请稍后再试。</div>'; });
+      .catch(() => {
+        if (my !== seq) return;
+        out.innerHTML = '<div class="analysis-msg">分析失败，请稍后再试。</div>';
+      });
   }
   btn.onclick = run;
   input.addEventListener("keydown", e => { if (e.key === "Enter") run(); });
