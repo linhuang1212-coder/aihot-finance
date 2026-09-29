@@ -504,17 +504,21 @@ class Handler(BaseHTTPRequestHandler):
         self._head_only = True
         self._dispatch()
 
-    def _dispatch(self):
+    def do_POST(self):
+        self._head_only = False
+        self._dispatch(self._route_post)
+
+    def _dispatch(self, route=None):
         """兜底:任何未预期异常都回 500 JSON,而不是直接断连接(经 nginx 就成了 502)。
         响应头已经发出去之后再出错,就不能再补一个 500(会被拼进正文),只断开连接。"""
         self._headers_flushed = False
         try:
-            self._route()
+            (route or self._route)()
         except _CLIENT_GONE:
             self.close_connection = True
         except Exception:
-            print("[%s] [http] %s %s 处理异常:\n%s"
-                  % (_now_str(), self.command, self.path, traceback.format_exc()))
+            print("[%s] [http] %s %s 处理异常:\n%s"           # 只记路径:查询串里可能有参数/密钥
+                  % (_now_str(), self.command, urlparse(self.path).path, traceback.format_exc()))
             self.close_connection = True
             if not self._headers_flushed:
                 try:
@@ -571,6 +575,16 @@ class Handler(BaseHTTPRequestHandler):
             group = qs.get("group", [None])[0]
             return self._send_json(store.prop_detail(group))
 
+        if path in ("/api/label/next", "/api/label/stats"):
+            import labeling
+            if not labeling.check_key(self.headers.get("X-Label-Key")):
+                return self._send_json({"error": "forbidden"}, 403)
+            out = {"stats": labeling.stats()}
+            if path == "/api/label/next":
+                it = labeling.next_item(ITEMS)
+                out["item"] = labeling.public_view(it) if it else None
+            return self._send_json(out)
+
         if path == "/api/analysis":
             if self._head_only:                 # HEAD 不能触发付费生成
                 return self._send_json({"error": "method not allowed"}, 405,
@@ -602,6 +616,44 @@ class Handler(BaseHTTPRequestHandler):
         if os.path.splitext(target)[1].lower() in STATIC_TYPES and os.path.isfile(target):
             return self._send_static(target)
         return self._send_json({"error": "not found", "path": path}, 404)
+
+
+    def _route_post(self):
+        """唯一的写接口:精选校准标注(见 labeling.py 的安全约束)。其它 POST 一律 405。"""
+        import labeling
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/label":
+            return self._send_json({"error": "method not allowed"}, 405, [("Allow", "GET, HEAD")])
+        if not labeling.check_key(self.headers.get("X-Label-Key")):
+            return self._send_json({"error": "forbidden"}, 403)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n <= 0 or n > labeling.MAX_BODY:
+            self.close_connection = True
+            return self._send_json({"error": "bad body size"}, 413 if n > 0 else 400)
+        try:
+            body = json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:                        # 非 JSON / 非 UTF-8 / 超深嵌套
+            return self._send_json({"error": "bad request"}, 400)
+        if not isinstance(body, dict) or not isinstance(body.get("id"), str):
+            return self._send_json({"error": "bad request"}, 400)
+        iid, label = body["id"], body.get("label")
+        if type(label) is not int or label not in (0, 1):   # bool/浮点/字符串都不收
+            return self._send_json({"error": "bad label"}, 400)
+        it = next((x for x in ITEMS if x.get("id") == iid), None)
+        if it is None:
+            return self._send_json({"error": "unknown id"}, 404)
+        if labeling.rate_limited():
+            return self._send_json({"error": "too many requests"}, 429)
+        try:
+            import llm
+            pv = (llm._load().get(iid) or {}).get("pv")
+        except Exception:
+            pv = None
+        labeling.record(it, label, pv)
+        return self._send_json({"ok": True, "stats": labeling.stats()})
 
 
 class Server(ThreadingHTTPServer):

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN" translate="no">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="google" content="notranslate" />
+<meta name="robots" content="noindex" />
+<meta name="referrer" content="no-referrer" />
+<title>精选校准 · 标注</title>
+<style>
+  :root { --bg:#131210; --card:#1c1a17; --text:#ece6dc; --dim:#9d968b; --line:#2e2b26;
+          --yes:#c9543f; --no:#4f8a5b; --skip:#6b665d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; line-height:1.6; }
+  main { max-width:760px; margin:0 auto; padding:20px 16px 120px; }
+  header { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  .progress { color:var(--dim); font-size:14px; }
+  .hint { color:var(--dim); font-size:13px; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; }
+  .meta { color:var(--dim); font-size:13px; margin-bottom:8px; }
+  .title { font-size:19px; font-weight:600; margin:0 0 10px; }
+  .summary { margin:0 0 10px; }
+  .orig { color:var(--dim); font-size:14px; white-space:pre-wrap; word-break:break-word;
+          border-left:3px solid var(--line); padding-left:10px; margin:10px 0 0; }
+  .segs { margin:8px 0 0; padding-left:18px; }
+  a { color:#d8b27a; }
+  .bar { position:fixed; left:0; right:0; bottom:0; background:rgba(19,18,16,.96);
+         border-top:1px solid var(--line); padding:12px 16px; }
+  .bar .inner { max-width:760px; margin:0 auto; display:flex; gap:10px; }
+  button { flex:1; font-size:17px; padding:14px 8px; border:0; border-radius:8px; color:#fff; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  .yes { background:var(--yes); } .no { background:var(--no); } .skip { background:var(--skip); flex:.6; }
+  kbd { font-size:12px; opacity:.8; margin-left:6px; }
+  .msg { color:var(--dim); text-align:center; padding:40px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>精选校准 · 这条要推给你吗？</h1>
+    <div class="progress" id="progress">…</div>
+  </header>
+  <div class="hint">按你的真实偏好判断：<b>要</b> = 推到手机上你会庆幸看到；<b>不要</b> = 噪音、离题或重复。拿不准就跳过。目标 200 条。</div>
+  <div id="view"><div class="msg">加载中…</div></div>
+</main>
+<div class="bar"><div class="inner">
+  <button class="yes" id="yes">要<kbd>J</kbd></button>
+  <button class="no" id="no">不要<kbd>K</kbd></button>
+  <button class="skip" id="skip">跳过<kbd>空格</kbd></button>
+</div></div>
+<script>
+(function () {
+  // 密钥放在 # 后面:不会发给服务器,不进 nginx 访问日志,也不进 Referer
+  const key = new URLSearchParams(location.hash.slice(1)).get("key") || "";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const safeUrl = (u) => /^https?:\/\//i.test(u || "") ? u : "#";
+  let cur = null, busy = false;
+
+  function setBusy(b) { busy = b; ["yes", "no", "skip"].forEach((id) => { $(id).disabled = b || !cur; }); }
+  function showStats(s) { if (s) $("progress").textContent = "已标 " + s.labeled + " 条（要 " + s.keep + "）/ 目标 200"; }
+
+  function render(it) {
+    cur = it;
+    if (!it) { $("view").innerHTML = '<div class="msg">近 7 天的条目都标完了，谢谢！</div>'; setBusy(false); return; }
+    const t = (it.published_at || "").replace("T", " ").slice(5, 16);
+    const orig = it.title_orig || it.body_excerpt || "";
+    const segs = (it.segments || []).map((s) => "<li>" + esc(s) + "</li>").join("");
+    $("view").innerHTML =
+      '<div class="card">' +
+      '<div class="meta">' + esc(it.source) + " · " + esc(t) +
+      ' · <a href="' + esc(safeUrl(it.source_url)) + '" target="_blank" rel="noopener noreferrer">原文链接</a></div>' +
+      '<p class="title">' + esc(it.title_zh) + "</p>" +
+      (it.summary_zh && it.summary_zh !== it.title_zh ? '<p class="summary">' + esc(it.summary_zh) + "</p>" : "") +
+      (segs ? '<ul class="segs">' + segs + "</ul>" : "") +
+      (orig && orig !== it.title_zh ? '<div class="orig">' + esc(orig) + "</div>" : "") +
+      "</div>";
+    setBusy(false);
+  }
+
+  function fail(msg) { $("view").innerHTML = '<div class="msg">' + esc(msg) + "</div>"; cur = null; setBusy(false); }
+
+  function next() {
+    setBusy(true);
+    fetch("api/label/next", { cache: "no-store", headers: { "X-Label-Key": key } })
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((d) => { showStats(d.stats); render(d.item); })
+      .catch((e) => fail(e === 403 ? "链接里的密钥不对。" : "加载失败，稍后刷新重试。"));
+  }
+
+  function send(label) {
+    if (busy || !cur) return;
+    setBusy(true);
+    fetch("api/label", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Label-Key": key },
+      body: JSON.stringify({ id: cur.id, label: label }),
+    })
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((d) => { showStats(d.stats); next(); })
+      .catch((e) => { setBusy(false); alert(e === 429 ? "太快了，歇一下再标。" : "提交失败，请重试。"); });
+  }
+
+  $("yes").onclick = () => send(1);
+  $("no").onclick = () => send(0);
+  $("skip").onclick = () => { if (!busy) next(); };
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "j" || e.key === "J") { e.preventDefault(); send(1); }
+    else if (e.key === "k" || e.key === "K") { e.preventDefault(); send(0); }
+    else if (e.key === " " || e.key === "l" || e.key === "L") { e.preventDefault(); if (!busy) next(); }
+  });
+  if (!key) fail("缺少密钥：请用我给你的完整链接打开。"); else next();
+})();
+</script>
+</body>
+</html>
