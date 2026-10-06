@@ -65,9 +65,12 @@ AI_KEYWORDS = ["AI", "人工智能", "英伟达", "Nvidia", "OpenAI", "大模型
 SELECT_THRESHOLD = 5.0  # 综合分 >= 此值进「精选」(无 LLM 时的关键词兜底路径)
 # LLM 重要度 >= 此值进「精选」(= 推 Telegram)。只对新 prompt 打的分(缓存里有 pv)生效;
 # 旧 prompt 打的分(没有 pv)沿用旧门槛,两套刻度不混。
-# 2026-09-29 按新 prompt 的分数分布定为目标约 40 条/天,待用户标注后再按数据校准。
-SELECT_IMP = 7
+# 2026-10-06 用户改口径:「与金融市场相关、与任何股票题材相关的都要发,重复的筛掉」——
+# prompt 改成由模型自己判断相关性,6 = 「相关且有新信息」即推送线;重复由模型的 dup 字段筛。
+# (09-30~10-06 曾按「只推用户框架内的前 8%」用过门槛 7,用户反馈内容太少。)
+SELECT_IMP = 6
 LEGACY_SELECT_IMP = 6
+JUNK_IMP = 3            # X 推文被判「非财经」且重要度 <= 此值:闲聊/回复碎片/娱乐,不入库
 
 IMPORTANT_KW = {  # 重要度关键词 -> 权重
     "美联储": 3, "fed": 3, "利率": 2, "降息": 3, "加息": 3, "rate cut": 3, "rate hike": 3,
@@ -204,6 +207,10 @@ def _save_trans():
         _trans_dirty = False
 
 
+# DeepSeek 对只有链接/无法翻译的输入会回一句道歉,曾被当成译文写进标题
+_REFUSAL_RE = re.compile(r"(无法访问(该|这个)?链接|请(提供|将)需要翻译的|无法(直接)?翻译|我无法(访问|打开|查看))")
+
+
 def reset_translate_round():
     """每轮开始时调用:清零本轮预算和熔断计数。"""
     global _trans_budget, _trans_fail
@@ -243,6 +250,8 @@ def translate(text, budget_max=220):
             time.sleep(0.05)  # 轻微节流，避免触发限频
         except Exception as e:
             print("[trans] error:", e)
+    if zh and _REFUSAL_RE.search(zh[:60]):
+        return text      # 模型没翻译而是回了句「抱歉,我无法访问该链接…」:不当译文,也不算服务故障
     if zh:
         cache[text] = zh
         _trans_dirty = True
@@ -1055,7 +1064,13 @@ def fetch_all():
     try:                                                 # LLM 增强（可选，自动跳过）
         import llm
         # 金十只喂「个股(A股)栏」,用不到增强(情绪/重要度)-> 跳过,省 DeepSeek 约 2/3
-        n = llm.enrich([it for it in reps if not is_hidden(it)])
+        try:                                             # 这批条目时间点之前已推送的,交给模型判重
+            import store
+            vis = [it["published_at"] for it in reps if not is_hidden(it) and it.get("published_at")]
+            recent = store.recent_selected(before=max(vis) if vis else None)
+        except Exception:
+            recent = []
+        n = llm.enrich([it for it in reps if not is_hidden(it)], recent=recent, push_imp=SELECT_IMP)
         if n:
             print("[llm] enriched %d new items" % n)
     except Exception as e:
@@ -1065,8 +1080,10 @@ def fetch_all():
         if it.get("llm_fin") is False:                   # LLM 判定非财经
             if not (it.get("source") or "").startswith("X·"):
                 continue                                 # 非白名单源:丢弃
-            # X 白名单是人工挑的账号:不丢(推文只抓一次,丢了回不来),只是不进精选。
-            # 2026-09-30 新 prompt 初版曾把约 30% 的地缘/政治推文判成 fin=false。
+            imp = it.get("llm_importance")
+            if imp is not None and imp <= JUNK_IMP:
+                continue                                 # 「@某人 是的」「🤡」这类闲聊碎片:不入库
+            # 其余 X 条目即使被判非财经也不丢(推文只抓一次,误判了回不来),只是不进精选。
             _finalize(it)
             it["selected"] = False
             out.append(it)
@@ -1162,6 +1179,8 @@ def _finalize(it):
         it["score"], it["selected"] = round(s, 2), imp >= _select_imp(it)
     else:
         it["score"], it["selected"] = _score(it)
+    if it.get("llm_dup"):
+        it["selected"] = False       # 模型判定与近期已推送的某条是同一件事:留在全量,不再推
     if is_hidden(it):
         # 金十只喂「个股(A股)栏」:强制不选中 -> 不进精选/主线、不推 Telegram;
         # server.refresh 据 source 派生 stock_only,filter_items 只在个股视图放行。

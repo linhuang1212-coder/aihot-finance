@@ -10,6 +10,7 @@ X(Twitter) 信源(twitterapi.io,可选)。
 """
 
 import os
+import re
 import json
 import urllib.parse
 import urllib.request
@@ -24,6 +25,12 @@ STATE_FILE = os.path.join(BASE_DIR, "data", "x_state.json")
 API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 CST = timezone(timedelta(hours=8))
 MAX_PAGES = 3                      # 每片成本护栏(每页约 20 条)
+# 断供追补:水位落后超过 CATCHUP_GAP_MIN 时(欠费/断网恢复后),每轮只抓「水位之后 CATCHUP_WINDOW_MIN
+# 分钟」这一段(until_time),按时间顺序一段段补到现在。原来恢复后只会抓最新的 ~120 条,中间全丢。
+# 每段的量控制在单轮翻译/打分预算之内(2 小时约 70-90 条)。
+CATCHUP_GAP_MIN = 45
+CATCHUP_WINDOW_MIN = 120
+CATCHUP_MAX_PAGES = 8
 FIRST_RUN_BACK_MIN = 30            # 首跑只回看 30 分钟,避免历史灌爆
 OVERLAP_SEC = 60                   # 水位重叠 1 分钟防边界丢推(id 去重兜底)
 QUERY_CHAR_BUDGET = 450            # X 高级搜索 query 上限 512 字符,超长会被静默
@@ -83,9 +90,14 @@ def _parse_time(s):
         return datetime.now(CST)
 
 
+_NO_CONTENT_RE = re.compile(r"https?://\S+|@\w+|\s+")
+
+
 def _to_item(tw, acct):
     import newsfetch                # 懒导入复用翻译/哈希(同 store->newsfetch 先例)
     text = (tw.get("text") or "").strip()
+    if not _NO_CONTENT_RE.sub("", text):
+        return None                 # 只有链接/@某人 的推文:没有内容可翻译、可打分
     zh = newsfetch.translate(text[:300])
     user = (tw.get("author") or {}).get("userName") or acct.get("user", "")
     dt = _parse_time(tw.get("createdAt") or "")
@@ -135,19 +147,27 @@ def fetch_x():
     now_ts = int(datetime.now(CST).timestamp())
     state = _load_state()
     since = int(state.get("last_since_time") or (now_ts - FIRST_RUN_BACK_MIN * 60))
+    until, pages = None, MAX_PAGES
+    if now_ts - since > CATCHUP_GAP_MIN * 60:        # 落后太多:本轮只补一段
+        until = min(since + CATCHUP_WINDOW_MIN * 60, now_ts)
+        pages = CATCHUP_MAX_PAGES
     items = []
     try:
         for chunk in _account_chunks(accts):
             query = "(%s) -filter:retweets since_time:%d" % (
                 " OR ".join("from:" + a["user"] for a in chunk), since)
+            if until:
+                query += " until_time:%d" % until
             cursor = ""
-            for _ in range(MAX_PAGES):
+            for _ in range(pages):
                 d = _call(query, cursor)
                 for tw in d.get("tweets") or []:
                     user = ((tw.get("author") or {}).get("userName") or "").lower()
                     acct = by_user.get(user)
                     if acct and tw.get("id"):
-                        items.append(_to_item(tw, acct))
+                        it = _to_item(tw, acct)
+                        if it:
+                            items.append(it)
                 if not d.get("has_next_page") or not d.get("next_cursor"):
                     break
                 cursor = d["next_cursor"]
@@ -156,8 +176,11 @@ def fetch_x():
         health.note_error("twitterapi", e)   # 402 余额用完等:连续失败 -> 告警
         return []                       # 失败不推进水位,下轮重试
     health.note_ok("twitterapi")
-    state["last_since_time"] = max(since, now_ts - OVERLAP_SEC)
+    state["last_since_time"] = max(since, (until or now_ts) - OVERLAP_SEC)
     _save_state(state)
-    if items:
+    if until and until < now_ts:
+        print("[xfetch] 追补 %s 之前的 %d 条,还落后 %d 分钟" % (
+            datetime.fromtimestamp(until, CST).strftime("%m-%d %H:%M"), len(items), (now_ts - until) // 60))
+    elif items:
         print("[xfetch] %d new tweets" % len(items))
     return items

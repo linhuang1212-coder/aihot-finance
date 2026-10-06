@@ -9,6 +9,7 @@ DeepSeek 智能增强层（可选）。
 """
 
 import os
+import re
 import json
 import urllib.request
 
@@ -90,6 +91,14 @@ def _load():
         _cache = atomicio.read_json(CACHE_FILE, {})
         if not isinstance(_cache, dict):
             _cache = {}
+        patch = CACHE_FILE + ".patch"            # tools/backfill_selection.py 重打分的结果
+        if os.path.exists(patch):
+            extra = atomicio.read_json(patch, {})
+            if isinstance(extra, dict) and extra:
+                _cache.update(extra)
+                if atomicio.write_json(CACHE_FILE, _cache):
+                    os.replace(patch, patch + ".applied")
+                    print("[llm] 合并回补缓存 %d 条" % len(extra))
     return _cache
 
 
@@ -114,9 +123,34 @@ def prune(keep_ids):
     return len(dead)
 
 
-def _call(news_lines):
-    user = ("新闻列表（逐条处理，i 用下面的序号）:\n" + news_lines +
-            '\n\n只输出 JSON 对象 {"items":[{"i","s","c","imp","fin","rumor","dir","tgt","str"}]}。')
+RECENT_MAX = 50              # 判重时给模型看的「近期已推送」最多几条
+RECENT_TITLE_CHARS = 70
+
+
+def _recent_block(recent):
+    """【近期已推送】列表(R1 最新)。只用于判重:同一件事被不同账号/不同译法重复报道时,
+    模型在 dup 里填被重复那条的编号,这条就不再推送。"""
+    if not recent:
+        return ""
+    lines = ["R%d. %s" % (k + 1, " ".join((r.get("title") or "").split())[:RECENT_TITLE_CHARS])
+             for k, r in enumerate(recent[:RECENT_MAX])]
+    return "【近期已推送】(只用于判重,不要给它们打分):\n" + "\n".join(lines) + "\n\n"
+
+
+def _resolve_dup(ref, recent, batch, j):
+    """模型返回的 dup 编号(R3 / B2)-> 被重复条目的 id。无效/指向自己/指向后面的 -> None。"""
+    m = re.match(r"^\s*([RrBb])\s*(\d+)\s*$", str(ref or ""))
+    if not m:
+        return None
+    n = int(m.group(2)) - 1
+    if m.group(1) in "Rr":
+        return recent[n]["id"] if 0 <= n < min(len(recent), RECENT_MAX) else None
+    return batch[n]["id"] if 0 <= n < j else None
+
+
+def _call(news_lines, recent_block=""):
+    user = (recent_block + "新闻列表（逐条处理，i 用下面的序号）:\n" + news_lines +
+            '\n\n只输出 JSON 对象 {"items":[{"i","s","c","imp","fin","rumor","dir","tgt","str","dup"}]}。')
     body = json.dumps({
         "model": MODEL, "temperature": 0, "max_tokens": 1500,
         "response_format": {"type": "json_object"},
@@ -161,10 +195,13 @@ def translate(text):
     return (d["choices"][0]["message"]["content"] or "").strip()
 
 
-def enrich(items, budget=DEFAULT_BUDGET):
-    """就地增强 items（去重后的代表条目）。返回实际新处理条数。"""
+def enrich(items, budget=DEFAULT_BUDGET, recent=None, push_imp=None):
+    """就地增强 items（去重后的代表条目）。返回实际新处理条数。
+    recent: 近期已推送的条目 [{"id","title"}](新的在前),交给模型判重;
+    push_imp: 推送线。给了就把本轮里过线且不重复的条目滚动加进 recent,同一轮后面的重复也能认出来。"""
     if not enabled():
         return 0
+    recent = list(recent or [])
     cache = _load()
     todo = [it for it in items if it["id"] not in cache][:budget]
     done = fails = bad400 = 0
@@ -174,8 +211,9 @@ def enrich(items, budget=DEFAULT_BUDGET):
     while queue:
         batch = queue.pop(0)
         lines = "\n".join("%d. %s" % (j + 1, build_line(it)) for j, it in enumerate(batch))
+        seen_recent = list(recent)               # 这一批看到的列表快照(编号要对得上)
         try:
-            results = _call(lines)
+            results = _call(lines, _recent_block(seen_recent))
             fails = bad400 = 0
             any_ok = True
         except Exception as e:
@@ -217,6 +255,12 @@ def enrich(items, budget=DEFAULT_BUDGET):
                 "str": r.get("str"),
                 "pv": pv,
             }
+            dup = _resolve_dup(r.get("dup"), seen_recent, batch, j)
+            if dup:
+                cache[it["id"]]["dup"] = dup
+            elif push_imp is not None and r.get("fin", True) and (r.get("imp") or 0) >= push_imp:
+                recent.insert(0, {"id": it["id"], "title": it.get("title_zh") or ""})
+                del recent[RECENT_MAX:]
             done += 1
     if any_ok:
         # 服务本身正常时,单条被拒的记个墓碑,以后主轮/补救轮都不再提交它(整体故障时不记,免得全被标死)
@@ -238,6 +282,8 @@ def enrich(items, budget=DEFAULT_BUDGET):
             it["llm_importance"] = r["imp"]
             it["llm_pv"] = r.get("pv")
         it["llm_fin"] = bool(r.get("fin", True))
+        if r.get("dup"):                         # 与近期已推送的某条是同一件事 -> 不再推
+            it["llm_dup"] = r["dup"]
         if r.get("rumor"):                       # LLM 判定为传闻 -> 标未证实
             it["verified"] = "unverified"
         if r.get("dir"):                         # 利多/利空/中性（缺失则不塞，优雅降级）

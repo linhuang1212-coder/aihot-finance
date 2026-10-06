@@ -68,7 +68,7 @@ def score(prompt_path, items, out_path, batch=8):
         chunk = todo[i:i + batch]
         lines = "\n".join("%d. %s" % (j + 1, llm.build_line(it)) for j, it in enumerate(chunk))
         user = ("新闻列表（逐条处理，i 用下面的序号）:\n" + lines +
-                '\n\n只输出 JSON 对象 {"items":[{"i","s","c","imp","fin","rumor","dir","tgt","str"}]}。')
+                '\n\n只输出 JSON 对象 {"items":[{"i","s","c","imp","fin","rumor","dir","tgt","str","dup"}]}。')
         body = json.dumps({
             "model": llm.MODEL, "temperature": 0, "max_tokens": 1500,
             "response_format": {"type": "json_object"},

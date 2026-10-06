@@ -286,7 +286,7 @@ class TestEnrich400Split(unittest.TestCase):
         import urllib.error
         items = [{"id": "i%d" % k, "title_zh": ("毒" if k == 3 else "正常%d" % k)} for k in range(8)]
 
-        def fake_call(lines):
+        def fake_call(lines, recent_block=""):
             if "毒" in lines:
                 raise urllib.error.HTTPError("http://x", 400, "bad", {}, None)
             n = len(lines.split("\n"))

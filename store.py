@@ -234,6 +234,23 @@ def recent_items(days=None):
 _CJK_RE = re.compile(r"[一-鿿]")
 
 
+def recent_selected(hours=18, limit=50, before=None):
+    """before(ISO 时间,默认现在)之前 hours 小时内已进精选(=已推送)的条目 [{"id","title"}],新的在前。
+    交给打分模型判重。断供追补时这一批是几天前的推文,要拿「那个时间点附近」已推送的来比,所以按 before 取。"""
+    try:
+        ref = datetime.fromisoformat(before) if before else datetime.now(CST)
+    except ValueError:
+        ref = datetime.now(CST)
+    cutoff = (ref - timedelta(hours=hours)).isoformat(timespec="seconds")
+    con = _conn()
+    rows = con.execute(
+        "SELECT id, title_zh FROM items WHERE selected=1 AND published_at >= ? AND published_at <= ? "
+        "ORDER BY published_at DESC LIMIT ?",
+        (cutoff, ref.isoformat(timespec="seconds"), limit)).fetchall()
+    con.close()
+    return [{"id": r[0], "title": r[1] or ""} for r in rows]
+
+
 def repair_candidates(hours=48, limit=30, exclude=()):
     """近 hours 小时内需要补救的 X 条目:标题没翻成中文(不含汉字) 或 没有情绪。
     X 推文只抓一次(水位推进后不会再来),翻译/增强那一轮失败就永远是英文标题、没有情绪——
